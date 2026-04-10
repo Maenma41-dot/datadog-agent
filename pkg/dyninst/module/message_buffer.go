@@ -15,7 +15,6 @@ import (
 	"github.com/google/btree"
 	"golang.org/x/time/rate"
 
-	"github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher"
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
@@ -91,7 +90,7 @@ type eventKey struct {
 
 type bufferedEvent struct {
 	key   eventKey
-	event dispatcher.Message
+	list *messageList
 }
 
 func cmpEventKey(a, b eventKey) int {
@@ -112,25 +111,25 @@ type bufferTree struct {
 	mb   *bufferedMessageTracker
 }
 
-func (bt *bufferTree) popMatchingEvent(key eventKey) (dispatcher.Message, bool) {
-	got, ok := bt.tree.Delete(bufferedEvent{key: key, event: dispatcher.Message{}})
+func (bt *bufferTree) popMatchingEvent(key eventKey) (*messageList, bool) {
+	got, ok := bt.tree.Delete(bufferedEvent{key: key})
 	if !ok {
-		return dispatcher.Message{}, false
+		return nil, false
 	}
-	bt.mb.release(len(got.event.Event()))
-	return got.event, true
+	bt.mb.release(got.list.totalSize())
+	return got.list, true
 }
 
 var duplicateEventLogLimiter = rate.NewLimiter(rate.Every(1*time.Minute), 10)
 
-func (bt *bufferTree) addEvent(key eventKey, event dispatcher.Message) (ok bool) {
-	size := len(event.Event())
+func (bt *bufferTree) addEvent(key eventKey, list *messageList) (ok bool) {
+	size := list.totalSize()
 	if !bt.mb.add(size) {
 		return false
 	}
 	if prev, ok := bt.tree.ReplaceOrInsert(bufferedEvent{
 		key:   key,
-		event: event,
+		list: list,
 	}); ok {
 		if duplicateEventLogLimiter.Allow() {
 			log.Warnf(
@@ -143,8 +142,8 @@ func (bt *bufferTree) addEvent(key eventKey, event dispatcher.Message) (ok bool)
 				key.goid, key.stackByteDepth, key.probeID,
 			)
 		}
-		bt.mb.release(len(prev.event.Event()))
-		prev.event.Release()
+		bt.mb.release(prev.list.totalSize())
+		prev.list.release()
 		return true
 	}
 	return true
@@ -153,7 +152,8 @@ func (bt *bufferTree) addEvent(key eventKey, event dispatcher.Message) (ok bool)
 func (bt *bufferTree) close() {
 	var toRelease int
 	bt.tree.Ascend(func(g bufferedEvent) bool {
-		toRelease += len(g.event.Event())
+		toRelease += g.list.totalSize()
+		g.list.release()
 		return true
 	})
 	bt.mb.release(toRelease)

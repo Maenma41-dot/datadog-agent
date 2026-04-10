@@ -61,7 +61,7 @@ func FuzzDecoder(f *testing.F) {
 		decoder, err := NewDecoder(irProg, &noopTypeNameResolver{}, time.Now())
 		require.NoError(t, err)
 		_, _, _ = decoder.Decode(Event{
-			EntryOrLine: output.Event(item),
+			EntryOrLine: output.SingleEvent(item),
 			ServiceName: "foo",
 		}, &noopSymbolicator{}, nil, []byte{})
 		require.Empty(t, decoder.entryOrLine.dataItems)
@@ -98,7 +98,7 @@ func TestDecoderManually(t *testing.T) {
 			decoder, err := NewDecoder(irProg, &noopTypeNameResolver{}, time.Now())
 			require.NoError(t, err)
 			buf, probe, err := decoder.Decode(Event{
-				EntryOrLine: output.Event(item),
+				EntryOrLine: output.SingleEvent(item),
 				ServiceName: "foo",
 			}, &noopSymbolicator{}, nil, []byte{})
 			require.NoError(t, err)
@@ -128,7 +128,7 @@ func TestDecoderProcessTags(t *testing.T) {
 		decoder, err := NewDecoder(irProg, &noopTypeNameResolver{}, time.Now())
 		require.NoError(t, err)
 		buf, _, err := decoder.Decode(Event{
-			EntryOrLine: output.Event(item),
+			EntryOrLine: output.SingleEvent(item),
 			ServiceName: "foo",
 			ProcessTags: "entrypoint.name:myapp,svc.user:my-service",
 		}, &noopSymbolicator{}, nil, []byte{})
@@ -142,7 +142,7 @@ func TestDecoderProcessTags(t *testing.T) {
 		decoder, err := NewDecoder(irProg, &noopTypeNameResolver{}, time.Now())
 		require.NoError(t, err)
 		buf, _, err := decoder.Decode(Event{
-			EntryOrLine: output.Event(item),
+			EntryOrLine: output.SingleEvent(item),
 			ServiceName: "foo",
 		}, &noopSymbolicator{}, nil, []byte{})
 		require.NoError(t, err)
@@ -158,7 +158,7 @@ func BenchmarkDecoder(b *testing.B) {
 			require.NoError(b, err)
 			symbolicator := &noopSymbolicator{}
 			event := Event{
-				EntryOrLine: output.Event(c.eventConstructor(b, irProg)),
+				EntryOrLine: output.SingleEvent(c.eventConstructor(b, irProg)),
 				ServiceName: "foo",
 			}
 			b.ResetTimer()
@@ -1348,7 +1348,7 @@ func TestDecoderPanics(t *testing.T) {
 	stringID := stringType.GetID()
 	decoder.decoderTypes[stringID] = &panicDecoderType{decoder.decoderTypes[stringID]}
 	_, _, err = decoder.Decode(Event{
-		EntryOrLine: output.Event(input),
+		EntryOrLine: output.SingleEvent(input),
 		ServiceName: "foo"},
 		&noopSymbolicator{},
 		nil,
@@ -1378,7 +1378,7 @@ func TestDecoderFailsOnEvaluationError(t *testing.T) {
 	stringID := stringType.GetID()
 	delete(decoder.decoderTypes, stringID)
 	out, _, err := decoder.Decode(Event{
-		EntryOrLine: output.Event(input),
+		EntryOrLine: output.SingleEvent(input),
 		ServiceName: "foo"},
 		&noopSymbolicator{},
 		nil,
@@ -1418,7 +1418,7 @@ func TestDecoderIsRobustToDataItemDecodingErrors(t *testing.T) {
 	require.Regexp(t, "not enough bytes to read data item", itemErr)
 
 	buf, probe, err := decoder.Decode(Event{
-		EntryOrLine: event,
+		EntryOrLine: output.SingleEvent(event),
 		ServiceName: "foo",
 	}, &noopSymbolicator{}, nil, []byte{})
 	require.NoError(t, err)
@@ -1459,7 +1459,7 @@ func TestDecoderFailsOnEvaluationErrorAndRetainsPassedBuffer(t *testing.T) {
 	// by each iteration of the loop. It's expected/possible that consumers
 	// of the decoder API will call Decode every time with the same buffer.
 	out, _, err := decoder.Decode(Event{
-		EntryOrLine: output.Event(input),
+		EntryOrLine: output.SingleEvent(input),
 		ServiceName: "foo"},
 		&noopSymbolicator{},
 		nil,
@@ -1547,7 +1547,7 @@ func TestDecoderMissingReturnEventEvaluationError(t *testing.T) {
 			header.Event_pairing_expectation = uint8(tt.pairingExpectation)
 
 			buf, probe, err := decoder.Decode(Event{
-				EntryOrLine: newEvent,
+				EntryOrLine: output.SingleEvent(newEvent),
 				Return:      nil, // Explicitly no return event
 				ServiceName: "foo",
 			}, &noopSymbolicator{}, nil, []byte{})
@@ -1597,7 +1597,7 @@ func TestDecoderNilPointerCaptureExpression(t *testing.T) {
 	input[bitsetOffset] = 9
 
 	buf, probe, err := decoder.Decode(Event{
-		EntryOrLine: output.Event(input),
+		EntryOrLine: output.SingleEvent(input),
 		ServiceName: "foo",
 	}, &noopSymbolicator{}, nil, []byte{})
 	require.NoError(t, err)
@@ -1638,7 +1638,7 @@ func TestDecoderNilPointerTemplateExpression(t *testing.T) {
 	input[bitsetOffset] = 6
 
 	buf, probe, err := decoder.Decode(Event{
-		EntryOrLine: output.Event(input),
+		EntryOrLine: output.SingleEvent(input),
 		ServiceName: "foo",
 	}, &noopSymbolicator{}, nil, []byte{})
 	require.NoError(t, err)

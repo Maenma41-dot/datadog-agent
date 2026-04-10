@@ -22,8 +22,8 @@ func trackerUsed(mb *bufferedMessageTracker) int {
 	return mb.mu.used
 }
 
-func makeMsg(size int) dispatcher.Message {
-	return dispatcher.MakeTestingMessage(make([]byte, size))
+func makeList(size int) *messageList {
+	return newMessageList(dispatcher.MakeTestingMessage(make([]byte, size)))
 }
 
 func TestBufferTreeAddAndPop(t *testing.T) {
@@ -33,13 +33,13 @@ func TestBufferTreeAddAndPop(t *testing.T) {
 
 	key := eventKey{goid: 1, stackByteDepth: 100, probeID: 5}
 
-	ok := bt.addEvent(key, makeMsg(64))
+	ok := bt.addEvent(key, makeList(64))
 	require.True(t, ok)
 	assert.Equal(t, 64, trackerUsed(mb))
 
 	msg, ok := bt.popMatchingEvent(key)
 	require.True(t, ok)
-	assert.Equal(t, 64, len(msg.Event()))
+	assert.Equal(t, 64, len(msg.event()))
 	assert.Equal(t, 0, trackerUsed(mb))
 }
 
@@ -60,13 +60,13 @@ func TestBufferTreeBufferFull(t *testing.T) {
 	defer bt.close()
 
 	key1 := eventKey{goid: 1, stackByteDepth: 100, probeID: 5}
-	ok := bt.addEvent(key1, makeMsg(80))
+	ok := bt.addEvent(key1, makeList(80))
 	require.True(t, ok)
 	assert.Equal(t, 80, trackerUsed(mb))
 
 	// This should fail: 80 + 80 > 100.
 	key2 := eventKey{goid: 2, stackByteDepth: 100, probeID: 5}
-	ok = bt.addEvent(key2, makeMsg(80))
+	ok = bt.addEvent(key2, makeList(80))
 	assert.False(t, ok)
 	assert.Equal(t, 80, trackerUsed(mb))
 }
@@ -84,12 +84,12 @@ func TestBufferTreeDuplicateAccounting(t *testing.T) {
 
 	key := eventKey{goid: 1, stackByteDepth: 100, probeID: 5}
 
-	ok := bt.addEvent(key, makeMsg(64))
+	ok := bt.addEvent(key, makeList(64))
 	require.True(t, ok)
 	assert.Equal(t, 64, trackerUsed(mb))
 
 	// Insert a duplicate with a different size.
-	ok = bt.addEvent(key, makeMsg(48))
+	ok = bt.addEvent(key, makeList(48))
 	require.True(t, ok, "duplicate should return true")
 	assert.Equal(t, 48, trackerUsed(mb),
 		"used should reflect the replacement event size")
@@ -97,7 +97,7 @@ func TestBufferTreeDuplicateAccounting(t *testing.T) {
 	// Pop should return the replacement and bring used back to zero.
 	msg, ok := bt.popMatchingEvent(key)
 	require.True(t, ok)
-	assert.Equal(t, 48, len(msg.Event()))
+	assert.Equal(t, 48, len(msg.event()))
 	assert.Equal(t, 0, trackerUsed(mb),
 		"used must be zero after popping the only event")
 }
@@ -109,16 +109,16 @@ func TestBufferTreeDuplicateSameSize(t *testing.T) {
 
 	key := eventKey{goid: 1, stackByteDepth: 100, probeID: 5}
 
-	ok := bt.addEvent(key, makeMsg(64))
+	ok := bt.addEvent(key, makeList(64))
 	require.True(t, ok)
 
-	ok = bt.addEvent(key, makeMsg(64))
+	ok = bt.addEvent(key, makeList(64))
 	require.True(t, ok)
 	assert.Equal(t, 64, trackerUsed(mb))
 
 	msg, ok := bt.popMatchingEvent(key)
 	require.True(t, ok)
-	assert.Equal(t, 64, len(msg.Event()))
+	assert.Equal(t, 64, len(msg.event()))
 	assert.Equal(t, 0, trackerUsed(mb))
 }
 
@@ -132,7 +132,7 @@ func TestBufferTreeCloseReleasesAccounting(t *testing.T) {
 		{goid: 3, stackByteDepth: 30, probeID: 3},
 	}
 	for _, k := range keys {
-		require.True(t, bt.addEvent(k, makeMsg(32)))
+		require.True(t, bt.addEvent(k, makeList(32)))
 	}
 	assert.Equal(t, 96, trackerUsed(mb))
 
@@ -151,18 +151,18 @@ func TestBufferTreeMultipleTreesShareTracker(t *testing.T) {
 	key1 := eventKey{goid: 1, stackByteDepth: 10, probeID: 1}
 	key2 := eventKey{goid: 2, stackByteDepth: 20, probeID: 2}
 
-	require.True(t, bt1.addEvent(key1, makeMsg(64)))
-	require.True(t, bt2.addEvent(key2, makeMsg(64)))
+	require.True(t, bt1.addEvent(key1, makeList(64)))
+	require.True(t, bt2.addEvent(key2, makeList(64)))
 	assert.Equal(t, 128, trackerUsed(mb))
 
 	// Tracker is full; a third add on either tree should fail.
 	key3 := eventKey{goid: 3, stackByteDepth: 30, probeID: 3}
-	assert.False(t, bt1.addEvent(key3, makeMsg(1)))
+	assert.False(t, bt1.addEvent(key3, makeList(1)))
 
 	// Releasing from one tree frees space for the other.
 	_, ok := bt1.popMatchingEvent(key1)
 	require.True(t, ok)
 	assert.Equal(t, 64, trackerUsed(mb))
-	require.True(t, bt1.addEvent(key3, makeMsg(32)))
+	require.True(t, bt1.addEvent(key3, makeList(32)))
 	assert.Equal(t, 96, trackerUsed(mb))
 }

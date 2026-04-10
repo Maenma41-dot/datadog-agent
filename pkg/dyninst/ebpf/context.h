@@ -99,6 +99,10 @@ typedef struct stack_machine {
   // condition evaluation to abort. Used together with condition_eval_error
   // to distinguish nil-caused failures from other evaluation errors.
   bool condition_nil_deref;
+  // Set to true by sm_chase_pointer when scratch_buf_serialize fails due to
+  // insufficient buffer space. Checked and cleared by SM_OP_CHASE_POINTERS
+  // to trigger a flush-and-continue.
+  bool buffer_full;
 
   // Dictionary pointer for generic shape functions. Set by
   // SM_OP_PROCESS_GO_DICT_TYPE on entry, propagated through call context
@@ -246,6 +250,11 @@ typedef struct global_ctx {
   // Set during goroutine iteration, read during stack machine execution.
   // Declared here, as pointers in maps are treated as scalars by verifier.
   struct pt_regs* regs;
+  // Continuation support: tracks how many fragments have been submitted so far.
+  uint16_t continuation_seq;
+  // Original probe invocation timestamp, shared across all continuation
+  // fragments for correlation.
+  uint64_t start_ns;
 } global_ctx_t;
 
 typedef struct call_depths_entry {
