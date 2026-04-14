@@ -249,3 +249,7 @@ AUTO_JIRA.md
 
 # Zed config
 .zed
+
+# Ignoring compressed schema
+pkg/config/schema/compressed/*.zstd
+
