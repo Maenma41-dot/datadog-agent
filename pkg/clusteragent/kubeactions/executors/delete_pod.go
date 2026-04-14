@@ -25,8 +25,9 @@ const (
 
 // ExecutionResult represents the result of executing an action
 type ExecutionResult struct {
-	Status  string
-	Message string
+	Status   string
+	Message  string
+	Payloads map[string]interface{}
 }
 
 // DeletePodExecutor executes delete pod actions
