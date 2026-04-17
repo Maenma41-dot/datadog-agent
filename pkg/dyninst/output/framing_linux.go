@@ -17,6 +17,7 @@ type EventHeader struct {
 	X__padding                [1]int8
 	Stack_hash                uint64
 	Ktime_ns                  uint64
+	Entry_ktime_ns            uint64
 }
 type DataItemHeader struct {
 	Type    uint32
