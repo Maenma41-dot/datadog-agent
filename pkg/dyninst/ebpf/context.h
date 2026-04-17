@@ -240,6 +240,11 @@ static stack_walk_ctx_t* stack_walk_ctx_load() {
   return stack;
 }
 
+// Sentinel for global_ctx.last_submitted_seq meaning "no fragment has been
+// submitted yet for this probe invocation". continuation_seq is uint16, so
+// 0xFFFF can never collide with a real sequence number.
+#define LAST_SUBMITTED_SEQ_NONE ((uint16_t)0xFFFF)
+
 typedef struct global_ctx {
   // Output and scratch buffer.
   scratch_buf_t* buf;
@@ -252,9 +257,26 @@ typedef struct global_ctx {
   struct pt_regs* regs;
   // Continuation support: tracks how many fragments have been submitted so far.
   uint16_t continuation_seq;
+  // continuation_seq of the last *successfully* submitted fragment, or
+  // LAST_SUBMITTED_SEQ_NONE if no fragment has been submitted yet. Used to
+  // fill in last_seq on drop notifications so userspace knows exactly how
+  // many fragments to expect when it reconstructs a truncated event.
+  uint16_t last_submitted_seq;
+  // Set true when a mid-chase flush failed: some fragments reached userspace
+  // but a later fragment couldn't be written. probe_run checks this flag
+  // after chasing completes and, if set, sends a PARTIAL_* notification and
+  // skips the final submit rather than emit a fragment with a gap.
+  bool continuation_aborted;
   // Original probe invocation timestamp, shared across all continuation
   // fragments for correlation.
   uint64_t start_ns;
+  // Invocation ID. For entry / line / inlined / no-body probes, this is the
+  // probe's own start_ns. For return probes, it is the entry's start_ns,
+  // pulled from in_progress_calls via call_depths_delete. Drop notifications
+  // emitted by this probe carry this value so userspace can key the
+  // notification by the same invocation identifier as the main-channel
+  // fragments.
+  uint64_t entry_ktime_ns;
 } global_ctx_t;
 
 typedef struct call_depths_entry {

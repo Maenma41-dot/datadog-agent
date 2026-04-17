@@ -82,7 +82,12 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
   }
   global_ctx.regs = NULL;
   global_ctx.continuation_seq = 0;
+  global_ctx.last_submitted_seq = LAST_SUBMITTED_SEQ_NONE;
+  global_ctx.continuation_aborted = false;
   global_ctx.start_ns = start_ns;
+  // entry_ktime_ns defaults to this probe's own start_ns. Return probes
+  // overwrite this with the entry's timestamp after call_depths_delete.
+  global_ctx.entry_ktime_ns = start_ns;
 
   // TODO: Move this check to after we've interacted with the call state.
   const int64_t out_ringbuf_avail_data =
@@ -148,8 +153,10 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
     // can resolve generic shape types on the return path.
     global_ctx.stack_machine->saved_dict_ptr = saved_dict_ptr;
     // Stamp the entry's timestamp on the return event so userspace can
-    // correlate entry and return for the same invocation.
+    // correlate entry and return for the same invocation. Also record it
+    // in global_ctx for any drop notifications this probe sends.
     header->entry_ktime_ns = entry_ktime_ns;
+    global_ctx.entry_ktime_ns = entry_ktime_ns;
     // If we're the last call for this goid, delete the entry.
     if (remaining == 0) {
       int ret = bpf_map_delete_elem(&in_progress_calls, &header->goid);
@@ -308,10 +315,15 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
   final_header->continuation_seq = global_ctx.continuation_seq;
   final_header->continuation_flags = 0; // final fragment
   if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
-    // TODO: Report dropped events metric.
+    // TODO: Report dropped events metric. Task 24 will add a drop
+    // notification here when last_submitted_seq indicates prior fragments
+    // were already sent, or on return-probe submit failure.
     LOG(1, "probe_run output dropped");
-  } else if (stack_hash != 0) {
-    upsert_stack_hash(stack_hash);
+  } else {
+    global_ctx.last_submitted_seq = global_ctx.continuation_seq;
+    if (stack_hash != 0) {
+      upsert_stack_hash(stack_hash);
+    }
   }
   LOG(1, "probe_run done: %d steps", process_steps + chase_steps);
   return;

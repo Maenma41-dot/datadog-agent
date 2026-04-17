@@ -29,10 +29,46 @@ typedef uint64_t buf_offset_t;
 #define RINGBUF_CAPACITY ((uint64_t)1 << 23)
 #define SCRATCH_BUF_LEN ((uint64_t)1 << 15) // 32KiB
 
+// Side-channel for drop notifications. Notifications are 32 bytes each; at
+// 16 KiB the side channel holds ~500 notifications — far more than the
+// number of concurrently-buffered events userspace can hold, so the side
+// channel is very unlikely to fill even when out_ringbuf is saturated.
+#define DROP_NOTIFY_RINGBUF_CAPACITY ((uint64_t)1 << 14) // 16KiB
+
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, RINGBUF_CAPACITY);
 } out_ringbuf SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, DROP_NOTIFY_RINGBUF_CAPACITY);
+} drop_notify_ringbuf SEC(".maps");
+
+// send_drop_notification publishes a drop notification to the side channel.
+// It is best-effort: if drop_notify_ringbuf is itself full, the notification
+// is lost. In that case the affected invocation's tree entry remains in
+// userspace's buffer until a later eviction path handles it. Userspace's
+// last-touch GC (future commit) is the eventual backstop.
+static inline void send_drop_notification(
+    uint32_t prog_id,
+    uint32_t probe_id,
+    uint64_t goid,
+    uint32_t stack_byte_depth,
+    uint16_t last_seq,
+    uint64_t entry_ktime_ns,
+    uint8_t drop_reason) {
+  di_drop_notification_t notif = {
+      .prog_id = prog_id,
+      .probe_id = probe_id,
+      .goid = goid,
+      .stack_byte_depth = stack_byte_depth,
+      .drop_reason = drop_reason,
+      .last_seq = last_seq,
+      .entry_ktime_ns = entry_ktime_ns,
+  };
+  bpf_ringbuf_output(&drop_notify_ringbuf, &notif, sizeof(notif), 0);
+}
 
 // A helper to check if the scratch buffer has enough space.
 static bool scratch_buf_bounds_check(buf_offset_t* offset, uint64_t len) {
@@ -87,10 +123,13 @@ static bool events_scratch_buf_submit(scratch_buf_t* scratch_buf,
 // Flush the current scratch buffer as a continuation fragment and reinitialize
 // for the next fragment. Returns true on success, false if the ringbuf is full.
 // start_ns is the original probe invocation timestamp, used to correlate all
-// fragments of a single logical event.
+// fragments of a single logical event. last_submitted_seq is updated on
+// success so probe_run can fill last_seq on any subsequent drop notification.
 static bool scratch_buf_flush_and_continue(scratch_buf_t* scratch_buf,
                                            uint16_t* continuation_seq,
-                                           uint64_t start_ns) {
+                                           uint16_t* last_submitted_seq,
+                                           uint64_t start_ns,
+                                           uint64_t entry_ktime_ns) {
   di_event_header_t* header = (di_event_header_t*)scratch_buf;
   header->continuation_seq = *continuation_seq;
   header->continuation_flags = 1; // more fragments follow
@@ -106,6 +145,7 @@ static bool scratch_buf_flush_and_continue(scratch_buf_t* scratch_buf,
     return false;
   }
 
+  *last_submitted_seq = *continuation_seq;
   (*continuation_seq)++;
 
   // Reinitialize the buffer with a continuation header.
@@ -120,6 +160,7 @@ static bool scratch_buf_flush_and_continue(scratch_buf_t* scratch_buf,
       .stack_byte_len = 0, // no stack trace in continuations
       .event_pairing_expectation = event_pairing_expectation,
       .ktime_ns = start_ns, // same timestamp for fragment correlation
+      .entry_ktime_ns = entry_ktime_ns,
   };
   return true;
 }
