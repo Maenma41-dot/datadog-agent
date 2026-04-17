@@ -126,6 +126,36 @@ func TestPairingStoreCloseReleasesBudget(t *testing.T) {
 		"close must release all tracked bytes")
 }
 
+// TestPairingStoreEntryKtimeDistinguishesInvocations verifies that two entries
+// sharing (goid, depth, probeID) but differing by EntryKtime are stored as
+// independent rows in the tree. This is the correlation-ID mechanism that
+// prevents late drop notifications for invocation N from affecting invocation
+// N+1 state.
+func TestPairingStoreEntryKtimeDistinguishesInvocations(t *testing.T) {
+	pb := NewPairingBudget(1024)
+	ps := pb.NewStore()
+	defer ps.Close()
+
+	k1 := PairingKey{Goid: 1, StackByteDepth: 100, ProbeID: 5, EntryKtime: 1000}
+	k2 := PairingKey{Goid: 1, StackByteDepth: 100, ProbeID: 5, EntryKtime: 2000}
+	require.True(t, ps.Add(k1, makeList(32)))
+	require.True(t, ps.Add(k2, makeList(64)))
+	assert.Equal(t, 96, budgetUsed(pb))
+
+	// Pop k1: k2 remains.
+	list, ok := ps.Pop(k1)
+	require.True(t, ok)
+	assert.Equal(t, 32, len(list.Head()))
+	list.Release()
+	assert.Equal(t, 64, budgetUsed(pb))
+
+	list, ok = ps.Pop(k2)
+	require.True(t, ok)
+	assert.Equal(t, 64, len(list.Head()))
+	list.Release()
+	assert.Equal(t, 0, budgetUsed(pb))
+}
+
 func TestPairingStoreMultipleStoresShareBudget(t *testing.T) {
 	pb := NewPairingBudget(128)
 	ps1 := pb.NewStore()

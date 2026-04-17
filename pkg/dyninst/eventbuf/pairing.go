@@ -82,13 +82,18 @@ func (pb *PairingBudget) release(size int) {
 	pb.mu.used -= size
 }
 
-// PairingKey identifies a single invocation of a probe. The goid plus
-// stack-byte-depth plus probe id is unique across concurrent calls (enforced
-// BPF-side via in_progress_calls).
+// PairingKey identifies a single invocation of a probe.
+//
+// (Goid, StackByteDepth, ProbeID) is unique across concurrent calls
+// (enforced BPF-side via in_progress_calls). EntryKtime further disambiguates
+// rapid sequential invocations with the same triple so that a drop
+// notification or late fragment for invocation N cannot affect invocation
+// N+1's state.
 type PairingKey struct {
 	Goid           uint64
 	StackByteDepth uint32
 	ProbeID        uint32
+	EntryKtime     uint64
 }
 
 type pairingEntry struct {
@@ -101,6 +106,7 @@ func cmpPairingKey(a, b PairingKey) int {
 		cmp.Compare(a.Goid, b.Goid),
 		cmp.Compare(a.StackByteDepth, b.StackByteDepth),
 		cmp.Compare(a.ProbeID, b.ProbeID),
+		cmp.Compare(a.EntryKtime, b.EntryKtime),
 	)
 }
 
@@ -130,13 +136,13 @@ func (ps *PairingStore) Add(key PairingKey, list *MessageList) (ok bool) {
 	if prev, ok := ps.tree.ReplaceOrInsert(pairingEntry{key: key, list: list}); ok {
 		if duplicateEventLogLimiter.Allow() {
 			log.Warnf(
-				"duplicate event for goid %d, stackByteDepth %d, probeID %d",
-				key.Goid, key.StackByteDepth, key.ProbeID,
+				"duplicate event for goid %d, stackByteDepth %d, probeID %d, entryKtime %d",
+				key.Goid, key.StackByteDepth, key.ProbeID, key.EntryKtime,
 			)
 		} else {
 			log.Tracef(
-				"duplicate event for goid %d, stackByteDepth %d, probeID %d",
-				key.Goid, key.StackByteDepth, key.ProbeID,
+				"duplicate event for goid %d, stackByteDepth %d, probeID %d, entryKtime %d",
+				key.Goid, key.StackByteDepth, key.ProbeID, key.EntryKtime,
 			)
 		}
 		ps.budget.release(prev.list.TotalSize())

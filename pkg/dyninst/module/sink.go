@@ -185,6 +185,7 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 		Goid:           evHeader.Goid,
 		StackByteDepth: evHeader.Stack_byte_depth,
 		ProbeID:        evHeader.Probe_id,
+		EntryKtime:     evHeader.Entry_ktime_ns,
 	}
 	var entryFragmented, returnFragmented output.FragmentedEvent
 	switch output.EventPairingExpectation(evHeader.Event_pairing_expectation) {
