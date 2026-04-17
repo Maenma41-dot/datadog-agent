@@ -1,0 +1,69 @@
+# A RETURN_LOST notification arrives for a key that has been fully
+# finalized. This creates a zombie tree entry. Subsequent activity on
+# other keys pushes the touch counter forward until EvictStale reaps
+# the zombie.
+config: {}
+ops:
+  # First invocation: pair and finalize k1.
+  - !add-fragment {key: k1, side: entry, seq: 0, final: true, expect_return: true, bytes: 40}
+  - !add-fragment {key: k1, side: return, seq: 0, final: true, expect_return: false, bytes: 40}
+  # Stale RETURN_LOST for k1 creates a zombie (no fragments exist).
+  - !note-return-lost {key: k1}
+  # Drive the touch counter forward on unrelated keys.
+  - !add-fragment {key: k2, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+  - !add-fragment {key: k3, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+  - !add-fragment {key: k4, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+  # EvictStale with a small maxIdle reaps the old zombie.
+  - !evict-stale {max_idle: 2}
+---
+op: !add-fragment {key: k1, side: entry, seq: 0, final: true, expect_return: true, bytes: 40}
+state:
+  budget_used: 40
+  bytes: 40
+  tree_size: 1
+---
+op: !add-fragment {key: k1, side: return, seq: 0, final: true, expect_return: false, bytes: 40}
+readys:
+  - {key: k1, entry_frags: 1, entry_bytes: 40, return_frags: 1, return_bytes: 40}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 0
+---
+op: !note-return-lost {key: k1}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 1
+---
+op: !add-fragment {key: k2, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+readys:
+  - {key: k2, entry_frags: 1, entry_bytes: 10, return_frags: 0, return_bytes: 0}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 1
+---
+op: !add-fragment {key: k3, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+readys:
+  - {key: k3, entry_frags: 1, entry_bytes: 10, return_frags: 0, return_bytes: 0}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 1
+---
+op: !add-fragment {key: k4, side: entry, seq: 0, final: true, expect_return: false, bytes: 10}
+readys:
+  - {key: k4, entry_frags: 1, entry_bytes: 10, return_frags: 0, return_bytes: 0}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 1
+---
+op: !evict-stale {max_idle: 2}
+readys:
+  - {key: k1, entry_frags: 0, entry_bytes: 0, return_frags: 0, return_bytes: 0, entry_truncated: true, return_lost: true}
+state:
+  budget_used: 0
+  bytes: 0
+  tree_size: 0
