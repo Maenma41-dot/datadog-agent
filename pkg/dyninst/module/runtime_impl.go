@@ -18,6 +18,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/DataDog/datadog-agent/pkg/dyninst/actuator"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/irgen"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/loader"
@@ -39,7 +40,7 @@ type runtimeImpl struct {
 	dispatcher               Dispatcher
 	logsFactory              erasedLogsUploaderFactory
 	procRuntimeIDbyProgramID *sync.Map
-	bufferedMessageTracker   *bufferedMessageTracker
+	pairingBudget            *eventbuf.PairingBudget
 	// tombstoneFilePath is the path to the tombstone file left behind to detect
 	// crashes while loading programs. If empty, tombstone files are not
 	// created.
@@ -211,8 +212,9 @@ func (rt *runtimeImpl) Load(
 			EntityID:    entityID,
 			ContainerID: containerID,
 		}),
-		tree:   rt.bufferedMessageTracker.newTree(),
-		probes: irProgram.Probes,
+		pairing:    rt.pairingBudget.NewStore(),
+		reassembly: eventbuf.NewReassemblyStore(),
+		probes:     irProgram.Probes,
 	}
 	rt.dispatcher.RegisterSink(programID, s)
 

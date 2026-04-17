@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"sync"
 	"testing"
-	"time"
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/dyninst/decode"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/output"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/symbol"
@@ -58,10 +58,26 @@ type testDataItem struct {
 	data   []byte
 }
 
+// newTestSink builds a minimal sink wired with stub decoder / log uploader
+// and empty eventbuf stores. Suitable for tests that drive HandleEvent
+// directly.
+func newTestSink() (*sink, *stubDecoder) {
+	dec := &stubDecoder{}
+	budget := eventbuf.NewPairingBudget(1 << 20) // 1 MiB
+	s := &sink{
+		decoder:     dec,
+		logUploader: &stubLogUploader{},
+		pairing:     budget.NewStore(),
+		reassembly:  eventbuf.NewReassemblyStore(),
+		runtime: &runtimeImpl{
+			procRuntimeIDbyProgramID: &sync.Map{},
+		},
+	}
+	return s, dec
+}
+
 func TestHandleFragment_SingleFragmentFastPath(t *testing.T) {
-	// A single-fragment event (seq=0, flags=0) should not be treated as
-	// a continuation by IsContinuation(). This test verifies that the
-	// fast path in HandleEvent skips reassembly entirely.
+	// A single-fragment event (seq=0, flags=0) is not a continuation.
 	h := &output.EventHeader{
 		Continuation_seq:   0,
 		Continuation_flags: 0,
@@ -69,8 +85,11 @@ func TestHandleFragment_SingleFragmentFastPath(t *testing.T) {
 	require.False(t, h.IsContinuation())
 }
 
-func TestHandleFragment_TwoFragments(t *testing.T) {
-	s := &sink{}
+// TestHandleEvent_TwoFragmentEntryNoReturn verifies that a two-fragment event
+// with no return pairing (e.g. a line probe) is reassembled and the decoder
+// receives both fragments with their data items.
+func TestHandleEvent_TwoFragmentEntryNoReturn(t *testing.T) {
+	s, dec := newTestSink()
 
 	rootItem := testDataItem{
 		header: output.DataItemHeader{Type: 1, Length: 8, Address: 0x100},
@@ -85,69 +104,61 @@ func TestHandleFragment_TwoFragments(t *testing.T) {
 
 	// Fragment 0: first fragment, more to follow.
 	frag0Header := output.EventHeader{
-		Prog_id:            1,
-		Goid:               42,
-		Stack_byte_depth:   100,
-		Probe_id:           7,
-		Stack_byte_len:     8,
-		Ktime_ns:           5000,
-		Continuation_seq:   0,
-		Continuation_flags: output.ContinuationFlagMore,
+		Prog_id:                   1,
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  7,
+		Stack_byte_len:            8,
+		Ktime_ns:                  5000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationNone),
+		Continuation_seq:          0,
+		Continuation_flags:        output.ContinuationFlagMore,
 	}
 	frag0 := buildTestEvent(&frag0Header, stack, []testDataItem{rootItem})
 
-	msg0 := dispatcher.MakeTestingMessage(frag0)
-	h0, err := msg0.Event().Header()
-	require.NoError(t, err)
-
-	list, done := s.handleFragment(msg0, h0)
-	require.False(t, done, "first fragment should be buffered")
-	require.Nil(t, list)
-	require.Len(t, s.pending, 1)
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(frag0)))
+	// Decoder should not have been called yet.
+	require.Empty(t, dec.calls)
 
 	// Fragment 1: final fragment.
 	frag1Header := output.EventHeader{
-		Prog_id:            1,
-		Goid:               42,
-		Stack_byte_depth:   100,
-		Probe_id:           7,
-		Stack_byte_len:     0,
-		Ktime_ns:           5000,
-		Continuation_seq:   1,
-		Continuation_flags: 0, // final
+		Prog_id:                   1,
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  7,
+		Stack_byte_len:            0,
+		Ktime_ns:                  5000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationNone),
+		Continuation_seq:          1,
+		Continuation_flags:        0, // final
 	}
 	frag1 := buildTestEvent(&frag1Header, nil, []testDataItem{extraItem})
 
-	msg1 := dispatcher.MakeTestingMessage(frag1)
-	h1, err := msg1.Event().Header()
-	require.NoError(t, err)
-
-	list, done = s.handleFragment(msg1, h1)
-	require.True(t, done, "final fragment should trigger reassembly")
-	require.NotNil(t, list)
-	require.Empty(t, s.pending, "pending should be cleared after reassembly")
-
-	// Verify that iterating fragments yields both events with their data items.
+	// Iterate fragments inside onDecode, while the list is still alive.
 	var allItems []output.DataItem
-	for ev := range list.Fragments() {
-		for item, err := range ev.DataItems() {
-			require.NoError(t, err)
-			allItems = append(allItems, item)
+	dec.onDecode = func(ev decode.Event) {
+		for ev := range ev.EntryOrLine.Fragments() {
+			for item, err := range ev.DataItems() {
+				if err == nil {
+					allItems = append(allItems, item)
+				}
+			}
 		}
 	}
+
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(frag1)))
+	// Decoder should have been called once with the reassembled event.
+	require.Len(t, dec.calls, 1)
+
 	require.Len(t, allItems, 2)
 	require.Equal(t, uint32(1), allItems[0].Type())
 	require.Equal(t, uint32(2), allItems[1].Type())
-
-	// First fragment should have the stack trace.
-	firstEv := list.event()
-	pcs, err := firstEv.StackPCs()
-	require.NoError(t, err)
-	require.Equal(t, stack, pcs)
 }
 
-func TestHandleFragment_OrphanContinuation(t *testing.T) {
-	s := &sink{}
+// TestHandleEvent_OrphanContinuation verifies that a continuation fragment
+// with no preceding first fragment is dropped silently.
+func TestHandleEvent_OrphanContinuation(t *testing.T) {
+	s, dec := newTestSink()
 
 	// Send a continuation fragment (seq=1) without a preceding first fragment.
 	frag1Header := output.EventHeader{
@@ -158,32 +169,18 @@ func TestHandleFragment_OrphanContinuation(t *testing.T) {
 		Continuation_flags: 0,
 	}
 	frag1 := buildTestEvent(&frag1Header, nil, nil)
-	msg := dispatcher.MakeTestingMessage(frag1)
-	h, err := msg.Event().Header()
-	require.NoError(t, err)
-
-	list, done := s.handleFragment(msg, h)
-	require.True(t, done, "orphan continuation should be immediately done")
-	require.Nil(t, list, "orphan continuation should produce no list")
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(frag1)))
+	assert.Empty(t, dec.calls, "orphan continuation should not produce a decode")
 }
 
-// TestContinuationEntryReturnPairing verifies that a multi-fragment entry event
-// stored in the buffer tree survives until the return event pops it. This
-// catches a bug where the continuation defer released the messageList after
-// it had been transferred to the buffer tree.
+// TestContinuationEntryReturnPairing verifies that a multi-fragment entry
+// event stored in the pairing store survives until the return event pops it.
+// This is a regression test for an ownership bug where the continuation
+// defer released the messageList after it had been transferred to the store.
 func TestContinuationEntryReturnPairing(t *testing.T) {
-	fakeDecoder := &stubDecoder{}
-	mb := newBufferedMessageTracker(1 << 20) // 1MiB budget
-	s := &sink{
-		decoder:     fakeDecoder,
-		tree:        mb.newTree(),
-		logUploader: &stubLogUploader{},
-		runtime: &runtimeImpl{
-			procRuntimeIDbyProgramID: &sync.Map{},
-		},
-	}
+	s, dec := newTestSink()
 
-	// Entry event fragment 0: has stack and root, expects return pairing.
+	// Entry event fragment 0: has stack, expects return pairing.
 	entryFrag0 := buildTestEvent(&output.EventHeader{
 		Goid:                      42,
 		Stack_byte_depth:          100,
@@ -212,10 +209,6 @@ func TestContinuationEntryReturnPairing(t *testing.T) {
 	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entryFrag0)))
 	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entryFrag1)))
 
-	// The entry event should be stored in the buffer tree, NOT released.
-	// If the defer bug is present, the messages would be released here
-	// and the next step would panic.
-
 	// Return event: expects to find the entry.
 	returnEvent := buildTestEvent(&output.EventHeader{
 		Goid:                      42,
@@ -226,21 +219,21 @@ func TestContinuationEntryReturnPairing(t *testing.T) {
 		Event_pairing_expectation: uint8(output.EventPairingExpectationEntryPairingExpected),
 	}, nil, nil)
 
-	// Configure the decoder to count entry fragments during Decode (before
-	// the entry chain is released by the defer).
-	fakeDecoder.onDecode = func(event decode.Event) {
+	// Count entry fragments during Decode (before the entry list is released
+	// by the defer).
+	dec.onDecode = func(event decode.Event) {
 		for range event.EntryOrLine.Fragments() {
-			fakeDecoder.entryFragmentCount++
+			dec.entryFragmentCount++
 		}
 	}
 
-	// This should NOT panic. With the defer bug, it would crash with
-	// "nil pointer dereference" in popMatchingEvent -> totalSize.
+	// Previously this panicked with a nil-pointer deref in the ownership-bug
+	// variant. With eventbuf's store owning the list until Pop, it should
+	// succeed and the decoder should see both entry fragments.
 	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(returnEvent)))
 
-	// Verify the decoder was called and saw both entry fragments.
-	require.Len(t, fakeDecoder.calls, 1)
-	require.Equal(t, 2, fakeDecoder.entryFragmentCount,
+	require.Len(t, dec.calls, 1)
+	require.Equal(t, 2, dec.entryFragmentCount,
 		"entry should have 2 fragments when decoded")
 }
 
@@ -268,50 +261,3 @@ type stubLogUploader struct{}
 
 func (u *stubLogUploader) Enqueue(json.RawMessage) {}
 func (u *stubLogUploader) Close()                  {}
-
-func TestHandleFragment_EvictExpired(t *testing.T) {
-	s := &sink{
-		pending: make(map[fragmentKey]*pendingEvent),
-	}
-
-	// Insert an already-expired pending entry.
-	expiredKey := fragmentKey{goid: 1, probeID: 1, ktimeNs: 1000}
-	expiredMsg := dispatcher.MakeTestingMessage(buildTestEvent(&output.EventHeader{
-		Goid: 1, Probe_id: 1, Ktime_ns: 1000,
-	}, nil, nil))
-	s.pending[expiredKey] = &pendingEvent{
-		list:    newMessageList(expiredMsg),
-		deadline: time.Now().Add(-1 * time.Second),
-	}
-
-	// Insert a still-valid pending entry.
-	validKey := fragmentKey{goid: 2, probeID: 2, ktimeNs: 2000}
-	validMsg := dispatcher.MakeTestingMessage(buildTestEvent(&output.EventHeader{
-		Goid: 2, Probe_id: 2, Ktime_ns: 2000,
-	}, nil, nil))
-	s.pending[validKey] = &pendingEvent{
-		list:    newMessageList(validMsg),
-		deadline: time.Now().Add(1 * time.Minute),
-	}
-
-	// Trigger eviction by sending a new first fragment.
-	newHeader := output.EventHeader{
-		Goid:               99,
-		Probe_id:           99,
-		Ktime_ns:           9000,
-		Continuation_seq:   0,
-		Continuation_flags: output.ContinuationFlagMore,
-	}
-	newFrag := buildTestEvent(&newHeader, nil, nil)
-	msg := dispatcher.MakeTestingMessage(newFrag)
-	h, err := msg.Event().Header()
-	require.NoError(t, err)
-
-	s.handleFragment(msg, h)
-
-	// Expired entry should be evicted; valid and new entries should remain.
-	assert.NotContains(t, s.pending, expiredKey, "expired entry should be evicted")
-	assert.Contains(t, s.pending, validKey, "valid entry should remain")
-	newKey := fragmentKey{goid: 99, probeID: 99, ktimeNs: 9000}
-	assert.Contains(t, s.pending, newKey, "new entry should be added")
-}

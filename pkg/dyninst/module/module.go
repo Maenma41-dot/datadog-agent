@@ -20,6 +20,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/dyninst/actuator"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/irgen"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/loader"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/module/tombstone"
@@ -103,7 +104,7 @@ func newUnstartedModule(deps dependencies, tombstoneFilePath string) *Module {
 	store := newProcessStore()
 	logsUploader := logsUploaderFactoryImpl[LogsUploader]{factory: deps.LogsFactory}
 	diagnostics := newDiagnosticsManager(deps.DiagnosticsUploader)
-	bufferedMessagesTracker := newBufferedMessageTracker(bufferedMessagesByteLimit)
+	pairingBudget := eventbuf.NewPairingBudget(bufferedMessagesByteLimit)
 	runtime := &runtimeImpl{
 		store:                    store,
 		diagnostics:              diagnostics,
@@ -116,7 +117,7 @@ func newUnstartedModule(deps dependencies, tombstoneFilePath string) *Module {
 		dispatcher:               deps.Dispatcher,
 		logsFactory:              logsUploader,
 		procRuntimeIDbyProgramID: &sync.Map{},
-		bufferedMessageTracker:   bufferedMessagesTracker,
+		pairingBudget:            pairingBudget,
 		tombstoneFilePath:        tombstoneFilePath,
 	}
 	deps.Actuator.SetRuntime(runtime)

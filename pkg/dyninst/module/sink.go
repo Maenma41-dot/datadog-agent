@@ -20,6 +20,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/dyninst/actuator"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/decode"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/output"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/symbol"
@@ -59,32 +60,6 @@ func (t *missingTypeTracker) drain() []string {
 	return ret
 }
 
-// fragmentKey identifies a logical event whose data may span multiple ringbuf
-// submissions (continuation fragments).
-type fragmentKey struct {
-	goid           uint64
-	stackByteDepth uint32
-	probeID        uint32
-	ktimeNs        uint64
-}
-
-// pendingEvent holds the message list for fragments being reassembled.
-type pendingEvent struct {
-	list    *messageList // linked list of fragment messages
-	lastSeq  uint16        // highest continuation_seq seen
-	deadline time.Time     // eviction deadline for incomplete reassembly
-}
-
-const (
-	// fragmentTimeout is how long we wait for continuation fragments before
-	// evicting an incomplete set. All fragments from a single probe invocation
-	// are produced in microseconds; this timeout is very generous.
-	fragmentTimeout = 100 * time.Millisecond
-	// maxPendingFragmentSets caps the number of in-flight reassembly sets to
-	// bound memory usage.
-	maxPendingFragmentSets = 64
-)
-
 type sink struct {
 	runtime      *runtimeImpl
 	decoder      Decoder
@@ -94,15 +69,13 @@ type sink struct {
 	service      string
 	processTags  string
 	logUploader  LogsUploader
-	tree         *bufferTree
+	pairing      *eventbuf.PairingStore
+	reassembly   *eventbuf.ReassemblyStore
 	missingTypes missingTypeTracker
 
 	// Probes is an ordered list of probes. The event header's probe_id is an
 	// index into this list.
 	probes []*ir.Probe
-
-	// pending holds fragment sets being reassembled from multi-fragment events.
-	pending map[fragmentKey]*pendingEvent
 }
 
 var _ dispatcher.Sink = &sink{}
@@ -118,8 +91,11 @@ var eventPairingCallCountExceededLogLimiter = rate.NewLimiter(rate.Every(10*time
 var eventPairingConditionFailedLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 
 func (s *sink) HandleEvent(msg dispatcher.Message) error {
+	// msgOwned tracks whether msg is still ours to release at the end of
+	// HandleEvent. Transfer of ownership to a messageList flips it to false.
+	msgOwned := true
 	defer func() {
-		if msg != (dispatcher.Message{}) {
+		if msgOwned && msg != (dispatcher.Message{}) {
 			msg.Release()
 		}
 	}()
@@ -131,19 +107,29 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 	}
 
 	// Handle multi-fragment continuation events. Non-final fragments are
-	// buffered; the final fragment triggers reassembly and falls through
-	// to the normal event processing path below.
+	// buffered; the final fragment triggers reassembly and falls through to
+	// the normal event processing path below.
 	//
-	// msgList holds the messageList for the current message (continuation
-	// or single-fragment). For continuation events, it's built by
-	// handleFragment. For single-fragment events that need to be stored in
-	// the buffer tree, it's created on demand below.
-	var msgList *messageList
-	var releaseMsgList = true // set to false if ownership transfers to buffer tree
+	// msgList holds the reassembled fragment list when we have one: either
+	// from the reassembly store (continuation) or from wrapping a single
+	// message for storage in the pairing store. nil when the event is
+	// single-fragment and we plan to emit directly.
+	var msgList *eventbuf.MessageList
+	releaseMsgList := true // cleared when ownership transfers to pairing store
 	if evHeader.IsContinuation() {
-		list, done := s.handleFragment(msg, evHeader)
+		list, done := s.reassembly.AddFragment(
+			eventbuf.FragmentKey{
+				Goid:           evHeader.Goid,
+				StackByteDepth: evHeader.Stack_byte_depth,
+				ProbeID:        evHeader.Probe_id,
+				KtimeNs:        evHeader.Ktime_ns,
+			},
+			wrapMessage(msg),
+			evHeader.Continuation_seq,
+			!evHeader.HasMoreFragments(),
+		)
+		msgOwned = false // ownership handed to the reassembly store
 		if !done {
-			msg = dispatcher.Message{} // held in pending list
 			return nil
 		}
 		if list == nil {
@@ -152,12 +138,11 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 		msgList = list
 		defer func() {
 			if releaseMsgList && msgList != nil {
-				msgList.release()
+				msgList.Release()
 			}
 		}()
-		msg = dispatcher.Message{} // prevent double-release by outer defer
 
-		msgEvent = msgList.event() // first fragment
+		msgEvent = msgList.Head() // first fragment for header/stack access
 		var rerr error
 		evHeader, rerr = msgEvent.Header()
 		if rerr != nil {
@@ -187,18 +172,24 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 			log.Tracef(format, probeID, issueMsg)
 		}
 	}
-	// entryFragmented and returnFragmented are the FragmentedEvent values
-	// passed to the decoder. They may be a *messageList (for multi-fragment
-	// or buffer-tree-stored events) or a SingleEvent (for single-fragment
-	// events where the message is released by the outer defer).
+	// fragmentedFromSingleton returns an output.FragmentedEvent view of the
+	// single message held in msg (when msgList is nil). Relies on msg still
+	// being owned by HandleEvent's defer.
+	fragmentedFromSingleton := func() output.FragmentedEvent {
+		if msgList != nil {
+			return msgList
+		}
+		return output.SingleEvent(msgEvent)
+	}
+	pairingKey := eventbuf.PairingKey{
+		Goid:           evHeader.Goid,
+		StackByteDepth: evHeader.Stack_byte_depth,
+		ProbeID:        evHeader.Probe_id,
+	}
 	var entryFragmented, returnFragmented output.FragmentedEvent
 	switch output.EventPairingExpectation(evHeader.Event_pairing_expectation) {
 	case output.EventPairingExpectationEntryPairingExpected:
-		entryChain, ok := s.tree.popMatchingEvent(eventKey{
-			goid:           evHeader.Goid,
-			stackByteDepth: evHeader.Stack_byte_depth,
-			probeID:        evHeader.Probe_id,
-		})
+		entryList, ok := s.pairing.Pop(pairingKey)
 		// We expected to find a matching entry event but didn't. This could
 		// happen if we ran out of buffer space for the entry event.
 		if !ok {
@@ -215,41 +206,30 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 			}
 			return nil
 		}
-		defer entryChain.release()
-		entryFragmented = entryChain
-		if msgList != nil {
-			returnFragmented = msgList
-		} else {
-			returnFragmented = output.SingleEvent(msgEvent)
-		}
+		defer entryList.Release()
+		entryFragmented = entryList
+		returnFragmented = fragmentedFromSingleton()
 	case output.EventPairingExpectationReturnPairingExpected:
-		// Store the entry event (possibly multi-fragment) in the buffer tree
+		// Store the entry event (possibly multi-fragment) in the pairing store
 		// for later pairing with the return event.
 		if msgList == nil {
-			msgList = newMessageList(msg)
+			msgList = eventbuf.NewMessageList(wrapMessage(msg))
+			msgOwned = false
 		}
-		if s.tree.addEvent(eventKey{
-			goid:           evHeader.Goid,
-			stackByteDepth: evHeader.Stack_byte_depth,
-			probeID:        evHeader.Probe_id,
-		}, msgList) {
+		if s.pairing.Add(pairingKey, msgList) {
 			// Record stack PCs for later use when the return event arrives.
 			if stackPCs, err := msgEvent.StackPCs(); err == nil {
 				s.decoder.ReportStackPCs(evHeader.Stack_hash, slices.Clone(stackPCs))
 			}
-			msg = dispatcher.Message{}      // prevent release; owned by list
-			releaseMsgList = false          // prevent release by continuation defer
+			releaseMsgList = false
 			return nil
 		}
-		// addEvent failed (buffer full). Release the list we just created
-		// for the single-message case, then fall through to emit directly.
+		// Add failed (budget full). Release the list we just wrapped around
+		// the single message; fall through to emit directly.
 		if !evHeader.IsContinuation() {
-			msgList.release()
+			msgList.Release()
 			msgList = nil
 		}
-
-		// If the buffer was full, mark the event to inform the user, and output
-		// it directly.
 		evHeader.Event_pairing_expectation =
 			uint8(output.EventPairingExpectationBufferFull)
 		recordEventPairingIssue(
@@ -257,41 +237,24 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 			eventPairingBufferFullLogLimiter,
 			"userspace buffer capacity exceeded",
 		)
-		if msgList != nil {
-			entryFragmented = msgList
-		} else {
-			entryFragmented = output.SingleEvent(msgEvent)
-		}
+		entryFragmented = fragmentedFromSingleton()
 	case output.EventPairingExpectationCallMapFull:
 		recordEventPairingIssue(
 			&s.runtime.stats.eventPairingCallMapFull,
 			eventPairingCallMapFullLogLimiter,
 			"call map capacity exceeded",
 		)
-		if msgList != nil {
-			entryFragmented = msgList
-		} else {
-			entryFragmented = output.SingleEvent(msgEvent)
-		}
+		entryFragmented = fragmentedFromSingleton()
 	case output.EventPairingExpectationCallCountExceeded:
 		recordEventPairingIssue(
 			&s.runtime.stats.eventPairingCallCountExceeded,
 			eventPairingCallCountExceededLogLimiter,
 			"maximum call count exceeded",
 		)
-		if msgList != nil {
-			entryFragmented = msgList
-		} else {
-			entryFragmented = output.SingleEvent(msgEvent)
-		}
+		entryFragmented = fragmentedFromSingleton()
 	case output.EventPairingExpectationConditionFailed:
-		entryChain, ok := s.tree.popMatchingEvent(eventKey{
-			goid:           evHeader.Goid,
-			stackByteDepth: evHeader.Stack_byte_depth,
-			probeID:        evHeader.Probe_id,
-		})
-		if ok {
-			entryChain.release()
+		if entryList, ok := s.pairing.Pop(pairingKey); ok {
+			entryList.Release()
 		}
 		recordEventPairingIssue(
 			&s.runtime.stats.eventPairingConditionFailed,
@@ -302,11 +265,7 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 	case output.EventPairingExpectationNone,
 		output.EventPairingExpectationNoneInlined,
 		output.EventPairingExpectationNoneNoBody:
-		if msgList != nil {
-			entryFragmented = msgList
-		} else {
-			entryFragmented = output.SingleEvent(msgEvent)
-		}
+		entryFragmented = fragmentedFromSingleton()
 	default:
 		return fmt.Errorf("unknown event pairing expectation: %d", evHeader.Event_pairing_expectation)
 	}
@@ -351,95 +310,6 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 	return nil
 }
 
-// handleFragment processes a continuation fragment. It returns (nil, false) when
-// the fragment has been buffered and more fragments are expected. It returns
-// (list, true) when reassembly is complete. It returns (nil, true) when the
-// fragment is an orphan (no matching first fragment).
-func (s *sink) handleFragment(msg dispatcher.Message, h *output.EventHeader) (*messageList, bool) {
-	if s.pending == nil {
-		s.pending = make(map[fragmentKey]*pendingEvent)
-	}
-
-	key := fragmentKey{
-		goid:           h.Goid,
-		stackByteDepth: h.Stack_byte_depth,
-		probeID:        h.Probe_id,
-		ktimeNs:        h.Ktime_ns,
-	}
-
-	isFinal := !h.HasMoreFragments()
-
-	if h.Continuation_seq == 0 {
-		// First fragment: start a new list.
-		s.evictExpiredFragments()
-		s.pending[key] = &pendingEvent{
-			list:    newMessageList(msg),
-			lastSeq:  0,
-			deadline: time.Now().Add(fragmentTimeout),
-		}
-		if isFinal {
-			// seq=0 and no more fragments, but IsContinuation() was true,
-			// which shouldn't happen. Treat as complete single event.
-			pe := s.pending[key]
-			delete(s.pending, key)
-			return pe.list, true
-		}
-		return nil, false
-	}
-
-	// Continuation fragment (seq > 0).
-	pe, ok := s.pending[key]
-	if !ok {
-		// First fragment was lost — discard this continuation.
-		log.Tracef("orphan continuation fragment seq=%d for goid=%d probe=%d",
-			h.Continuation_seq, h.Goid, h.Probe_id)
-		return nil, true
-	}
-
-	pe.list.append(msg)
-	pe.lastSeq = h.Continuation_seq
-
-	if !isFinal {
-		return nil, false
-	}
-
-	// Final fragment received — return the complete list.
-	delete(s.pending, key)
-	return pe.list, true
-}
-
-// evictExpiredFragments removes incomplete fragment sets that have passed their
-// deadline. Called periodically when new first-fragments arrive.
-func (s *sink) evictExpiredFragments() {
-	if len(s.pending) == 0 {
-		return
-	}
-	now := time.Now()
-	for key, pe := range s.pending {
-		if now.After(pe.deadline) {
-			log.Tracef("evicting expired fragment set for goid=%d probe=%d (seq=%d)",
-				key.goid, key.probeID, pe.lastSeq)
-			pe.list.release()
-			delete(s.pending, key)
-		}
-	}
-	// If still over the cap, evict the oldest entries.
-	for len(s.pending) >= maxPendingFragmentSets {
-		var oldestKey fragmentKey
-		var oldestDeadline time.Time
-		for key, pe := range s.pending {
-			if oldestDeadline.IsZero() || pe.deadline.Before(oldestDeadline) {
-				oldestKey = key
-				oldestDeadline = pe.deadline
-			}
-		}
-		if pe, ok := s.pending[oldestKey]; ok {
-			pe.list.release()
-		}
-		delete(s.pending, oldestKey)
-	}
-}
-
 func (s *sink) Close() {
 	if s.logUploader != nil {
 		s.logUploader.Close()
@@ -449,5 +319,6 @@ func (s *sink) Close() {
 			log.Warnf("failed to close symbolicator: %v", err)
 		}
 	}
-	s.tree.close()
+	s.pairing.Close()
+	s.reassembly.Close()
 }
