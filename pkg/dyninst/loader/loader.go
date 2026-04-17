@@ -36,6 +36,13 @@ type Loader struct {
 	ringbufMap    *ebpf.Map
 	ringbufReader *ringbuf.Reader
 
+	// Side-channel ringbuffer for drop notifications. Carries fixed-size
+	// messages informing userspace that an event couldn't be submitted on
+	// the main ringbuffer, so userspace can salvage or discard the
+	// associated buffered state rather than leak it.
+	dropNotifyMap    *ebpf.Map
+	dropNotifyReader *ringbuf.Reader
+
 	ebpfSpec *ebpf.CollectionSpec
 }
 
@@ -86,7 +93,7 @@ func (l *Loader) Load(program compiler.Program) (*Program, error) {
 	}
 	defer func() {
 		for k, m := range maps {
-			if k == ringbufMapName {
+			if k == ringbufMapName || k == dropNotifyMapName {
 				continue
 			}
 			_ = m.Close()
@@ -102,6 +109,7 @@ func (l *Loader) Load(program compiler.Program) (*Program, error) {
 	opts := ebpf.CollectionOptions{}
 	opts.MapReplacements = maps
 	opts.MapReplacements[ringbufMapName] = l.ringbufMap
+	opts.MapReplacements[dropNotifyMapName] = l.dropNotifyMap
 	collection, err := ebpf.NewCollectionWithOptions(spec, opts)
 	if err != nil {
 		var ve *ebpf.VerifierError
@@ -155,6 +163,15 @@ func (l *Loader) OutputReader() *ringbuf.Reader {
 	return l.ringbufReader
 }
 
+// DropNotifyReader returns the side-channel ringbuffer reader carrying
+// drop notifications.
+func (l *Loader) DropNotifyReader() *ringbuf.Reader {
+	if l.dropNotifyReader == nil {
+		panic("drop-notify ringbuffer reader not initialized")
+	}
+	return l.dropNotifyReader
+}
+
 // Close releases loader resources.
 func (l *Loader) Close() (err error) {
 	if l.ringbufReader != nil {
@@ -162,6 +179,12 @@ func (l *Loader) Close() (err error) {
 	}
 	if l.ringbufMap != nil {
 		err = errors.Join(err, l.ringbufMap.Close())
+	}
+	if l.dropNotifyReader != nil {
+		err = errors.Join(err, l.dropNotifyReader.Close())
+	}
+	if l.dropNotifyMap != nil {
+		err = errors.Join(err, l.dropNotifyMap.Close())
 	}
 	return err
 }
@@ -210,6 +233,12 @@ func (p *Program) RuntimeStats() []RuntimeStats {
 
 const defaultRingbufSize = 1 << 20 // 1 MiB
 const ringbufMapName = "out_ringbuf"
+
+// Side-channel ringbuf. Small (16 KiB ~= 500 notifications); notifications
+// are fixed-size so it very rarely fills under pressure. Kept in sync with
+// DROP_NOTIFY_RINGBUF_CAPACITY in ../ebpf/scratch.h.
+const defaultDropNotifyRingbufSize = 1 << 14
+const dropNotifyMapName = "drop_notify_ringbuf"
 
 type config struct {
 	ebpfConfig *ddebpf.Config
@@ -275,6 +304,18 @@ func (l *Loader) init(opts ...Option) error {
 	if err != nil {
 		return fmt.Errorf("failed to create ringbuffer reader: %w", err)
 	}
+	l.dropNotifyMap, err = ebpf.NewMap(&ebpf.MapSpec{
+		Name:       dropNotifyMapName,
+		Type:       ebpf.RingBuf,
+		MaxEntries: defaultDropNotifyRingbufSize,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create drop-notify ringbuffer map: %w", err)
+	}
+	l.dropNotifyReader, err = ringbuf.NewReader(l.dropNotifyMap)
+	if err != nil {
+		return fmt.Errorf("failed to create drop-notify ringbuffer reader: %w", err)
+	}
 	obj, err := getBpfObject(&l.config)
 	if err != nil {
 		return fmt.Errorf("failed to get eBPF object: %w", err)
@@ -290,6 +331,9 @@ func (l *Loader) init(opts ...Option) error {
 		return errors.New("ringbuffer map not found in eBPF spec")
 	}
 	ringbufMapSpec.MaxEntries = uint32(l.config.ringBufSize)
+	if _, ok := l.ebpfSpec.Maps[dropNotifyMapName]; !ok {
+		return errors.New("drop-notify ringbuffer map not found in eBPF spec")
+	}
 	return nil
 }
 

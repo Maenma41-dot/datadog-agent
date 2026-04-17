@@ -311,6 +311,15 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 	return nil
 }
 
+// HandleDropNotification receives a side-channel drop notification for one
+// of this sink's probes. This commit installs a stub; task 27 drains the
+// notification through an eventbuf-backed flow that salvages partial data
+// and emits entry-only when the return is lost.
+func (s *sink) HandleDropNotification(n output.DropNotification) {
+	// TODO(task 27): process via eventbuf.
+	_ = n
+}
+
 func (s *sink) Close() {
 	if s.logUploader != nil {
 		s.logUploader.Close()
