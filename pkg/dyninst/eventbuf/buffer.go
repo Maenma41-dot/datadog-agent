@@ -190,6 +190,27 @@ func (b *Buffer) NoteReturnLost(key Key) (Ready, bool) {
 	return b.tryFinalize(be)
 }
 
+// Discard removes any buffered state for the key without emitting. Used for
+// the "condition failed" signal: the return probe's BPF code sent an empty
+// marker event indicating the return condition evaluated to false, so the
+// buffered entry should be silently dropped.
+//
+// Any fragments (entry or return) held for the key are released. If the
+// key has no buffered state, Discard is a no-op.
+func (b *Buffer) Discard(key Key) {
+	be, ok := b.tree.Get(&bufferedEvent{key: key})
+	if !ok {
+		return
+	}
+	b.tree.Delete(be)
+	if be.entry != nil {
+		be.entry.Release()
+	}
+	if be.returnList != nil {
+		be.returnList.Release()
+	}
+}
+
 // NotePartial records a PARTIAL_ENTRY or PARTIAL_RETURN drop notification.
 // lastSeq is the continuation_seq of the last fragment BPF successfully
 // submitted on the indicated side; userspace should expect lastSeq+1

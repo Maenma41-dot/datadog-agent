@@ -462,6 +462,23 @@ func TestBuffer_EvictStale_Cutoff(t *testing.T) {
 	}
 }
 
+// TestBuffer_Discard: the condition-failed signal path. An entry is stored
+// and then Discarded; no Ready is emitted and the message is released.
+func TestBuffer_Discard(t *testing.T) {
+	b := NewBuffer()
+	em := newTestMessage(8)
+	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, true)
+	require.False(t, done)
+	require.Equal(t, 1, b.Len())
+
+	b.Discard(k(1, 1000))
+	assert.Equal(t, 0, b.Len())
+	assert.True(t, em.released)
+
+	// Discard on an empty key is a no-op.
+	b.Discard(k(42, 42))
+}
+
 // 23. Close() releases everything and returns Readys for in-flight entries.
 func TestBuffer_Close(t *testing.T) {
 	b := NewBuffer()

@@ -27,6 +27,17 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
+// dropNotifyChanSize caps how many drop notifications can queue between
+// drains. Same order of magnitude as the BPF side channel's capacity so the
+// channel almost never overflows in practice.
+const dropNotifyChanSize = 64
+
+// evictStaleMaxIdle caps how long (in buffer mutations) an in-flight entry
+// can sit without being touched before EvictStale reaps it. This is the
+// backstop for lost drop notifications or lost fragments — in the happy
+// path it never fires.
+const evictStaleMaxIdle = 1 << 12
+
 // missingTypeTracker collects type names that the decoder encounters in
 // interface values but cannot find in the IR type registry. It implements
 // decode.MissingTypeCollector and is drained by the sink after each Decode.
@@ -69,8 +80,8 @@ type sink struct {
 	service      string
 	processTags  string
 	logUploader  LogsUploader
-	pairing      *eventbuf.PairingStore
-	reassembly   *eventbuf.ReassemblyStore
+	buffer       *eventbuf.Buffer
+	dropNotifyCh chan output.DropNotification
 	missingTypes missingTypeTracker
 
 	// Probes is an ordered list of probes. The event header's probe_id is an
@@ -85,196 +96,189 @@ var _ dispatcher.Sink = &sink{}
 var decodingErrorLogLimiter = rate.NewLimiter(rate.Every(1*time.Minute), 10)
 
 var noMatchingEventLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
-var eventPairingBufferFullLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingCallMapFullLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingCallCountExceededLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingConditionFailedLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
+var dropNotifyChanFullLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 
+// keyFromHeader builds an eventbuf.Key from a (validated) event header.
+func keyFromHeader(h *output.EventHeader) eventbuf.Key {
+	return eventbuf.Key{
+		Goid:           h.Goid,
+		StackByteDepth: h.Stack_byte_depth,
+		ProbeID:        h.Probe_id,
+		EntryKtime:     h.Entry_ktime_ns,
+	}
+}
+
+// HandleEvent routes a single message from the primary ringbuf through the
+// event buffer, emitting decoded output whenever an invocation becomes
+// complete. Drop notifications queued by HandleDropNotification are drained
+// at the top of each call so fragment arrivals and notifications interleave
+// deterministically from the buffer's perspective.
 func (s *sink) HandleEvent(msg dispatcher.Message) error {
-	// msgOwned tracks whether msg is still ours to release at the end of
-	// HandleEvent. Transfer of ownership to a messageList flips it to false.
-	msgOwned := true
-	defer func() {
-		if msgOwned && msg != (dispatcher.Message{}) {
-			msg.Release()
-		}
-	}()
+	s.drainDropNotifications()
 
-	msgEvent := msg.Event()
-	evHeader, err := msgEvent.Header()
+	ev := msg.Event()
+	h, err := ev.Header()
 	if err != nil {
+		msg.Release()
 		return fmt.Errorf("error getting event header: %w", err)
 	}
 
-	// Handle multi-fragment continuation events. Non-final fragments are
-	// buffered; the final fragment triggers reassembly and falls through to
-	// the normal event processing path below.
-	//
-	// msgList holds the reassembled fragment list when we have one: either
-	// from the reassembly store (continuation) or from wrapping a single
-	// message for storage in the pairing store. nil when the event is
-	// single-fragment and we plan to emit directly.
-	var msgList *eventbuf.MessageList
-	releaseMsgList := true // cleared when ownership transfers to pairing store
-	if evHeader.IsContinuation() {
-		list, done := s.reassembly.AddFragment(
-			eventbuf.FragmentKey{
-				Goid:           evHeader.Goid,
-				StackByteDepth: evHeader.Stack_byte_depth,
-				ProbeID:        evHeader.Probe_id,
-				KtimeNs:        evHeader.Ktime_ns,
-			},
-			wrapMessage(msg),
-			evHeader.Continuation_seq,
-			!evHeader.HasMoreFragments(),
-		)
-		msgOwned = false // ownership handed to the reassembly store
-		if !done {
-			return nil
-		}
-		if list == nil {
-			return nil // orphan continuation, discarded
-		}
-		msgList = list
-		defer func() {
-			if releaseMsgList && msgList != nil {
-				msgList.Release()
-			}
-		}()
+	key := keyFromHeader(h)
+	expectation := output.EventPairingExpectation(h.Event_pairing_expectation)
 
-		msgEvent = msgList.Head() // first fragment for header/stack access
-		var rerr error
-		evHeader, rerr = msgEvent.Header()
-		if rerr != nil {
-			return fmt.Errorf("error reading reassembled event header: %w", rerr)
-		}
-	}
-
-	var (
-		decodedBytes []byte
-		probe        ir.ProbeDefinition
-	)
-
-	recordEventPairingIssue := func(
-		stats *atomic.Uint64, limiter *rate.Limiter, issueMsg string,
-	) {
-		stats.Add(1)
-		var probeID string
-		if int(evHeader.Probe_id) < len(s.probes) {
-			probeID = s.probes[evHeader.Probe_id].GetID()
-		} else {
-			probeID = fmt.Sprintf("unknown probeID %d", evHeader.Probe_id)
-		}
-		const format = "event pairing issue for probe %s: %s"
-		if limiter.Allow() {
-			log.Infof(format, probeID, issueMsg)
-		} else {
-			log.Tracef(format, probeID, issueMsg)
-		}
-	}
-	// fragmentedFromSingleton returns an output.FragmentedEvent view of the
-	// single message held in msg (when msgList is nil). Relies on msg still
-	// being owned by HandleEvent's defer.
-	fragmentedFromSingleton := func() output.FragmentedEvent {
-		if msgList != nil {
-			return msgList
-		}
-		return output.SingleEvent(msgEvent)
-	}
-	pairingKey := eventbuf.PairingKey{
-		Goid:           evHeader.Goid,
-		StackByteDepth: evHeader.Stack_byte_depth,
-		ProbeID:        evHeader.Probe_id,
-		EntryKtime:     evHeader.Entry_ktime_ns,
-	}
-	var entryFragmented, returnFragmented output.FragmentedEvent
-	switch output.EventPairingExpectation(evHeader.Event_pairing_expectation) {
-	case output.EventPairingExpectationEntryPairingExpected:
-		entryList, ok := s.pairing.Pop(pairingKey)
-		// We expected to find a matching entry event but didn't. This could
-		// happen if we ran out of buffer space for the entry event.
-		if !ok {
-			if noMatchingEventLogLimiter.Allow() {
-				log.Warnf(
-					"no matching event for goid %d, stackByteDepth %d, probeID %d",
-					evHeader.Goid, evHeader.Stack_byte_depth, evHeader.Probe_id,
-				)
-			} else {
-				log.Tracef(
-					"no matching event for goid %d, stackByteDepth %d, probeID %d",
-					evHeader.Goid, evHeader.Stack_byte_depth, evHeader.Probe_id,
-				)
-			}
-			return nil
-		}
-		defer entryList.Release()
-		entryFragmented = entryList
-		returnFragmented = fragmentedFromSingleton()
-	case output.EventPairingExpectationReturnPairingExpected:
-		// Store the entry event (possibly multi-fragment) in the pairing store
-		// for later pairing with the return event.
-		if msgList == nil {
-			msgList = eventbuf.NewMessageList(wrapMessage(msg))
-			msgOwned = false
-		}
-		if s.pairing.Add(pairingKey, msgList) {
-			// Record stack PCs for later use when the return event arrives.
-			if stackPCs, err := msgEvent.StackPCs(); err == nil {
-				s.decoder.ReportStackPCs(evHeader.Stack_hash, slices.Clone(stackPCs))
-			}
-			releaseMsgList = false
-			return nil
-		}
-		// Add failed (budget full). Release the list we just wrapped around
-		// the single message; fall through to emit directly.
-		if !evHeader.IsContinuation() {
-			msgList.Release()
-			msgList = nil
-		}
-		evHeader.Event_pairing_expectation =
-			uint8(output.EventPairingExpectationBufferFull)
-		recordEventPairingIssue(
-			&s.runtime.stats.eventPairingBufferFull,
-			eventPairingBufferFullLogLimiter,
-			"userspace buffer capacity exceeded",
-		)
-		entryFragmented = fragmentedFromSingleton()
-	case output.EventPairingExpectationCallMapFull:
-		recordEventPairingIssue(
-			&s.runtime.stats.eventPairingCallMapFull,
-			eventPairingCallMapFullLogLimiter,
-			"call map capacity exceeded",
-		)
-		entryFragmented = fragmentedFromSingleton()
-	case output.EventPairingExpectationCallCountExceeded:
-		recordEventPairingIssue(
-			&s.runtime.stats.eventPairingCallCountExceeded,
-			eventPairingCallCountExceededLogLimiter,
-			"maximum call count exceeded",
-		)
-		entryFragmented = fragmentedFromSingleton()
+	switch expectation {
 	case output.EventPairingExpectationConditionFailed:
-		if entryList, ok := s.pairing.Pop(pairingKey); ok {
-			entryList.Release()
-		}
-		recordEventPairingIssue(
+		// BPF-sent signal: the return condition evaluated to false, so
+		// discard any buffered entry for this invocation without emitting.
+		s.buffer.Discard(key)
+		s.recordEventPairingIssue(
 			&s.runtime.stats.eventPairingConditionFailed,
 			eventPairingConditionFailedLogLimiter,
 			"return condition failed",
+			h.Probe_id,
 		)
+		msg.Release()
+		s.postMutate()
 		return nil
-	case output.EventPairingExpectationNone,
-		output.EventPairingExpectationNoneInlined,
-		output.EventPairingExpectationNoneNoBody:
-		entryFragmented = fragmentedFromSingleton()
-	default:
-		return fmt.Errorf("unknown event pairing expectation: %d", evHeader.Event_pairing_expectation)
+	case output.EventPairingExpectationCallMapFull:
+		// BPF ran out of room in the in_progress_calls map. The entry event
+		// is emitted standalone (no return will come) with an operator log.
+		s.recordEventPairingIssue(
+			&s.runtime.stats.eventPairingCallMapFull,
+			eventPairingCallMapFullLogLimiter,
+			"call map capacity exceeded",
+			h.Probe_id,
+		)
+	case output.EventPairingExpectationCallCountExceeded:
+		s.recordEventPairingIssue(
+			&s.runtime.stats.eventPairingCallCountExceeded,
+			eventPairingCallCountExceededLogLimiter,
+			"maximum call count exceeded",
+			h.Probe_id,
+		)
 	}
-	decodedBytes, probe, err = s.decoder.Decode(decode.Event{
-		EntryOrLine: entryFragmented,
-		Return:      returnFragmented,
+
+	// Everything else carries fragment data. Route it through the buffer.
+	side, expectReturn := sideFromExpectation(expectation)
+	isFinal := !h.HasMoreFragments()
+	// Record stack PCs on the first fragment of an entry that expects a
+	// return; the return-side decode will use them.
+	if side == eventbuf.Entry && expectReturn && h.Continuation_seq == 0 {
+		if stackPCs, err := ev.StackPCs(); err == nil {
+			s.decoder.ReportStackPCs(h.Stack_hash, slices.Clone(stackPCs))
+		}
+	}
+	ready, done := s.buffer.AddFragment(
+		key, wrapMessage(msg), side, h.Continuation_seq, isFinal, expectReturn,
+	)
+	if done {
+		s.emit(ready)
+	}
+	s.postMutate()
+	return nil
+}
+
+// HandleDropNotification queues a notification to be drained on the next
+// HandleEvent call. Channel-based serialization avoids mutexes on the hot
+// event path.
+func (s *sink) HandleDropNotification(n output.DropNotification) {
+	select {
+	case s.dropNotifyCh <- n:
+	default:
+		// Channel full — notification lost. Same consequences as a
+		// secondary-ringbuf-full drop: userspace state for this invocation
+		// isn't promptly cleaned up, but EvictStale will reap it.
+		if dropNotifyChanFullLogLimiter.Allow() {
+			log.Warnf(
+				"drop-notification channel full for program %d; reason=%d probe=%d goid=%d",
+				n.Prog_id, n.Drop_reason, n.Probe_id, n.Goid,
+			)
+		} else {
+			log.Tracef(
+				"drop-notification channel full for program %d; reason=%d probe=%d goid=%d",
+				n.Prog_id, n.Drop_reason, n.Probe_id, n.Goid,
+			)
+		}
+	}
+}
+
+// drainDropNotifications consumes every queued notification and applies it
+// to the event buffer, emitting any Readys that become complete.
+func (s *sink) drainDropNotifications() {
+	for {
+		select {
+		case n := <-s.dropNotifyCh:
+			s.processDropNotification(n)
+		default:
+			return
+		}
+	}
+}
+
+func (s *sink) processDropNotification(n output.DropNotification) {
+	key := eventbuf.Key{
+		Goid:           n.Goid,
+		StackByteDepth: n.Stack_byte_depth,
+		ProbeID:        n.Probe_id,
+		EntryKtime:     n.Entry_ktime_ns,
+	}
+	var ready eventbuf.Ready
+	var done bool
+	switch output.DropReason(n.Drop_reason) {
+	case output.DropReasonReturnLost:
+		ready, done = s.buffer.NoteReturnLost(key)
+	case output.DropReasonPartialEntry:
+		ready, done = s.buffer.NotePartial(key, eventbuf.Entry, n.Last_seq)
+	case output.DropReasonPartialReturn:
+		ready, done = s.buffer.NotePartial(key, eventbuf.Return, n.Last_seq)
+	default:
+		log.Errorf("unknown drop reason %d", n.Drop_reason)
+		return
+	}
+	if done {
+		s.emit(ready)
+	}
+}
+
+// postMutate runs after each buffer mutation. For now this is just a
+// periodic EvictStale call; in the future it can also update metrics.
+func (s *sink) postMutate() {
+	for _, r := range s.buffer.EvictStale(evictStaleMaxIdle) {
+		s.emit(r)
+	}
+}
+
+// emit decodes and uploads the data in ready. Releases ready's messages
+// after decode.
+func (s *sink) emit(ready eventbuf.Ready) {
+	defer func() {
+		if ready.Entry != nil {
+			ready.Entry.Release()
+		}
+		if ready.Return != nil {
+			ready.Return.Release()
+		}
+	}()
+
+	entry, ret := fragmentedEvents(ready)
+	if entry == nil {
+		// Nothing to decode (e.g. a zombie entry with no fragments). Skip.
+		return
+	}
+
+	// decodedBytes is a fresh slice for each call — the log uploader
+	// takes ownership of the returned bytes, so reusing a per-sink buffer
+	// would corrupt previously-enqueued events on the next overwrite.
+	var decodedBytes []byte
+	decoded, probe, err := s.decoder.Decode(decode.Event{
+		EntryOrLine: entry,
+		Return:      ret,
 		ServiceName: s.service,
 		ProcessTags: s.processTags,
+		Truncated:   ready.EntryTruncated || ready.ReturnTruncated,
 	}, s.symbolicator, &s.missingTypes, decodedBytes)
 	if err != nil {
 		if probe != nil {
@@ -286,38 +290,72 @@ func (s *sink) HandleEvent(msg dispatcher.Message) error {
 					probe.GetID(), s.service, err,
 				)
 			}
-			return nil
+			return
 		}
 		if decodingErrorLogLimiter.Allow() {
-			log.Warnf(
-				"failed to decode event in service %s: %v",
-				s.service, err,
-			)
+			log.Warnf("failed to decode event in service %s: %v", s.service, err)
 		} else {
-			log.Tracef(
-				"failed to decode event in service %s: %v",
-				s.service, err,
-			)
+			log.Tracef("failed to decode event in service %s: %v", s.service, err)
 		}
-		// TODO: Report failures to the controller to remove the relevant probe
-		// or program.
-		return nil
+		return
 	}
 	s.runtime.setProbeMaybeEmitting(s.programID, probe)
 	if missingTypes := s.missingTypes.drain(); len(missingTypes) > 0 {
 		s.runtime.actuator.ReportMissingTypes(s.processID, missingTypes)
 	}
-	s.logUploader.Enqueue(decodedBytes)
-	return nil
+	s.logUploader.Enqueue(decoded)
 }
 
-// HandleDropNotification receives a side-channel drop notification for one
-// of this sink's probes. This commit installs a stub; task 27 drains the
-// notification through an eventbuf-backed flow that salvages partial data
-// and emits entry-only when the return is lost.
-func (s *sink) HandleDropNotification(n output.DropNotification) {
-	// TODO(task 27): process via eventbuf.
-	_ = n
+func (s *sink) recordEventPairingIssue(
+	stats *atomic.Uint64, limiter *rate.Limiter, issueMsg string, probeIdx uint32,
+) {
+	stats.Add(1)
+	var probeID string
+	if int(probeIdx) < len(s.probes) {
+		probeID = s.probes[probeIdx].GetID()
+	} else {
+		probeID = fmt.Sprintf("unknown probeID %d", probeIdx)
+	}
+	const format = "event pairing issue for probe %s: %s"
+	if limiter.Allow() {
+		log.Infof(format, probeID, issueMsg)
+	} else {
+		log.Tracef(format, probeID, issueMsg)
+	}
+}
+
+// fragmentedEvents returns the entry and return FragmentedEvent views to
+// hand to the decoder. Return may be nil when ready has no return side.
+func fragmentedEvents(ready eventbuf.Ready) (entry, ret output.FragmentedEvent) {
+	if ready.Entry != nil {
+		entry = ready.Entry
+	}
+	if ready.Return != nil {
+		ret = ready.Return
+	}
+	return entry, ret
+}
+
+// sideFromExpectation returns the buffer side the event feeds into, plus
+// whether the invocation expects a return (entry-side only).
+//
+// For unknown expectations, defaults to (Entry, false) — the decoder will
+// see the event as a standalone. This keeps the sink resilient to future
+// BPF additions of expectations.
+func sideFromExpectation(e output.EventPairingExpectation) (eventbuf.Side, bool) {
+	switch e {
+	case output.EventPairingExpectationReturnPairingExpected:
+		return eventbuf.Entry, true
+	case output.EventPairingExpectationEntryPairingExpected:
+		return eventbuf.Return, false
+	case output.EventPairingExpectationNone,
+		output.EventPairingExpectationNoneInlined,
+		output.EventPairingExpectationNoneNoBody,
+		output.EventPairingExpectationCallMapFull,
+		output.EventPairingExpectationCallCountExceeded:
+		return eventbuf.Entry, false
+	}
+	return eventbuf.Entry, false
 }
 
 func (s *sink) Close() {
@@ -329,6 +367,11 @@ func (s *sink) Close() {
 			log.Warnf("failed to close symbolicator: %v", err)
 		}
 	}
-	s.pairing.Close()
-	s.reassembly.Close()
+	// Close's contract: caller is done with this sink. Drain the drop
+	// channel and emit whatever the buffer still has.
+	s.drainDropNotifications()
+	for _, r := range s.buffer.Close() {
+		s.emit(r)
+	}
 }
+

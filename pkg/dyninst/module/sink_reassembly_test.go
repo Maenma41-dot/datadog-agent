@@ -59,16 +59,15 @@ type testDataItem struct {
 }
 
 // newTestSink builds a minimal sink wired with stub decoder / log uploader
-// and empty eventbuf stores. Suitable for tests that drive HandleEvent
+// and a fresh eventbuf.Buffer. Suitable for tests that drive HandleEvent
 // directly.
 func newTestSink() (*sink, *stubDecoder) {
 	dec := &stubDecoder{}
-	budget := eventbuf.NewPairingBudget(1 << 20) // 1 MiB
 	s := &sink{
-		decoder:     dec,
-		logUploader: &stubLogUploader{},
-		pairing:     budget.NewStore(),
-		reassembly:  eventbuf.NewReassemblyStore(),
+		decoder:      dec,
+		logUploader:  &stubLogUploader{},
+		buffer:       eventbuf.NewBuffer(eventbuf.NewBudget(1 << 30)),
+		dropNotifyCh: make(chan output.DropNotification, dropNotifyChanSize),
 		runtime: &runtimeImpl{
 			procRuntimeIDbyProgramID: &sync.Map{},
 		},

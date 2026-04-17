@@ -20,6 +20,7 @@ import (
 	"github.com/DataDog/datadog-agent/pkg/dyninst/actuator"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/ir"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/output"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/irgen"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/loader"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/module/tombstone"
@@ -40,7 +41,6 @@ type runtimeImpl struct {
 	dispatcher               Dispatcher
 	logsFactory              erasedLogsUploaderFactory
 	procRuntimeIDbyProgramID *sync.Map
-	pairingBudget            *eventbuf.PairingBudget
 	// tombstoneFilePath is the path to the tombstone file left behind to detect
 	// crashes while loading programs. If empty, tombstone files are not
 	// created.
@@ -212,9 +212,9 @@ func (rt *runtimeImpl) Load(
 			EntityID:    entityID,
 			ContainerID: containerID,
 		}),
-		pairing:    rt.pairingBudget.NewStore(),
-		reassembly: eventbuf.NewReassemblyStore(),
-		probes:     irProgram.Probes,
+		buffer:       eventbuf.NewBuffer(),
+		dropNotifyCh: make(chan output.DropNotification, dropNotifyChanSize),
+		probes:       irProgram.Probes,
 	}
 	rt.dispatcher.RegisterSink(programID, s)
 
