@@ -20,6 +20,7 @@ import (
 
 	"github.com/DataDog/datadog-agent/pkg/dyninst/actuator"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/dispatcher"
+	"github.com/DataDog/datadog-agent/pkg/dyninst/eventbuf"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/irgen"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/loader"
 	"github.com/DataDog/datadog-agent/pkg/dyninst/module/tombstone"
@@ -86,6 +87,11 @@ func NewModule(
 	return m, nil
 }
 
+// eventbufBudgetBytes is the per-process byte ceiling enforced across all
+// per-program event buffers. Matches the pre-Buffer pairing-store budget.
+// TODO: make this configurable.
+const eventbufBudgetBytes = 512 << 10
+
 // tombstoneFilePath is the path to the tombstone file left behind to detect
 // crashes while loading programs. If empty, tombstone files are not
 // created.
@@ -112,6 +118,7 @@ func newUnstartedModule(deps dependencies, tombstoneFilePath string) *Module {
 		dispatcher:               deps.Dispatcher,
 		logsFactory:              logsUploader,
 		procRuntimeIDbyProgramID: &sync.Map{},
+		eventbufBudget:           eventbuf.NewBudget(eventbufBudgetBytes),
 		tombstoneFilePath:        tombstoneFilePath,
 	}
 	deps.Actuator.SetRuntime(runtime)

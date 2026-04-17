@@ -243,9 +243,14 @@ func (s *sink) processDropNotification(n output.DropNotification) {
 	}
 }
 
-// postMutate runs after each buffer mutation. For now this is just a
-// periodic EvictStale call; in the future it can also update metrics.
+// postMutate runs after each buffer mutation. It drains any Readys the
+// buffer surfaced as part of budget-driven eviction (triggered when an
+// AddFragment exceeds the shared byte ceiling and forced the buffer to
+// evict its oldest entries), then runs the periodic stale-age eviction.
 func (s *sink) postMutate() {
+	for _, r := range s.buffer.TakePendingBudgetEvictions() {
+		s.emit(r)
+	}
 	for _, r := range s.buffer.EvictStale(evictStaleMaxIdle) {
 		s.emit(r)
 	}

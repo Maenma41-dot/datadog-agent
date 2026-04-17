@@ -41,6 +41,9 @@ type runtimeImpl struct {
 	dispatcher               Dispatcher
 	logsFactory              erasedLogsUploaderFactory
 	procRuntimeIDbyProgramID *sync.Map
+	// eventbufBudget is the per-process byte ceiling shared across all
+	// per-program sink buffers.
+	eventbufBudget *eventbuf.Budget
 	// tombstoneFilePath is the path to the tombstone file left behind to detect
 	// crashes while loading programs. If empty, tombstone files are not
 	// created.
@@ -212,7 +215,7 @@ func (rt *runtimeImpl) Load(
 			EntityID:    entityID,
 			ContainerID: containerID,
 		}),
-		buffer:       eventbuf.NewBuffer(),
+		buffer:       eventbuf.NewBuffer(rt.eventbufBudget),
 		dropNotifyCh: make(chan output.DropNotification, dropNotifyChanSize),
 		probes:       irProgram.Probes,
 	}
