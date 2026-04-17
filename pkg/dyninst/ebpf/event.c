@@ -256,10 +256,14 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
       header->data_byte_len = sizeof(di_event_header_t);
       header->stack_byte_len = 0;
       header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CONDITION_FAILED;
-      // TODO: If the ring buffer is full here, we leak the entry event in
-      // userspace. We accept this as a known limitation for now.
       if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
+        // The condition-failed signal couldn't reach userspace. Notify via
+        // the side channel so the buffered entry can be emitted alone rather
+        // than leaking until process shutdown.
         LOG(1, "probe_run: failed to submit condition-failed signal for return event");
+        send_drop_notification(
+            prog_id, params->probe_id, header->goid, header->stack_byte_depth,
+            0, global_ctx.entry_ktime_ns, DROP_REASON_RETURN_LOST);
       }
     }
     // Entry: in_progress_calls insertion was deferred, so nothing to clean up.
@@ -275,6 +279,9 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
       header->event_pairing_expectation = EVENT_PAIRING_EXPECTATION_CONDITION_FAILED;
       if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
         LOG(1, "probe_run: failed to submit throttled condition-failed signal");
+        send_drop_notification(
+            prog_id, params->probe_id, header->goid, header->stack_byte_depth,
+            0, global_ctx.entry_ktime_ns, DROP_REASON_RETURN_LOST);
       }
     }
     // Entry: in_progress_calls insertion was deferred, so nothing to clean up.
@@ -309,16 +316,45 @@ probe_run(uint64_t start_ns, const probe_params_t* params, struct pt_regs* regs)
     }
   }
   chase_steps = stack_machine_chase_pointers(&global_ctx);
+  if (global_ctx.continuation_aborted) {
+    // A mid-chase flush failed. Earlier fragments reached userspace but a
+    // later fragment couldn't be written. Skip the final submit — sending
+    // it now would leave a gap in the fragment sequence — and notify
+    // userspace that it should finalize the fragments it already has as a
+    // truncated event.
+    uint8_t reason = (params->kind == EVENT_KIND_RETURN)
+                         ? DROP_REASON_PARTIAL_RETURN
+                         : DROP_REASON_PARTIAL_ENTRY;
+    send_drop_notification(
+        prog_id, params->probe_id, header->goid, header->stack_byte_depth,
+        global_ctx.last_submitted_seq, global_ctx.entry_ktime_ns, reason);
+    LOG(1, "probe_run: continuation aborted at seq=%d", global_ctx.last_submitted_seq);
+    return;
+  }
   // Set final fragment metadata. If continuation_seq > 0, earlier fragments
   // were already submitted inline by SM_OP_CHASE_POINTERS.
   di_event_header_t* final_header = (di_event_header_t*)global_ctx.buf;
   final_header->continuation_seq = global_ctx.continuation_seq;
   final_header->continuation_flags = 0; // final fragment
   if (!events_scratch_buf_submit(global_ctx.buf, start_ns)) {
-    // TODO: Report dropped events metric. Task 24 will add a drop
-    // notification here when last_submitted_seq indicates prior fragments
-    // were already sent, or on return-probe submit failure.
     LOG(1, "probe_run output dropped");
+    if (global_ctx.last_submitted_seq != LAST_SUBMITTED_SEQ_NONE) {
+      // Some fragments already reached userspace; this final fragment is
+      // lost. Notify userspace to emit the partial event as truncated.
+      uint8_t reason = (params->kind == EVENT_KIND_RETURN)
+                           ? DROP_REASON_PARTIAL_RETURN
+                           : DROP_REASON_PARTIAL_ENTRY;
+      send_drop_notification(
+          prog_id, params->probe_id, header->goid, header->stack_byte_depth,
+          global_ctx.last_submitted_seq, global_ctx.entry_ktime_ns, reason);
+    } else if (params->kind == EVENT_KIND_RETURN) {
+      // No fragments were submitted; the return probe produced nothing in
+      // userspace. Tell userspace to emit the matching entry alone.
+      send_drop_notification(
+          prog_id, params->probe_id, header->goid, header->stack_byte_depth,
+          0, global_ctx.entry_ktime_ns, DROP_REASON_RETURN_LOST);
+    }
+    // Entry probe with no fragments: no userspace state to clean up.
   } else {
     global_ctx.last_submitted_seq = global_ctx.continuation_seq;
     if (stack_hash != 0) {
