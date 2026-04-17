@@ -25,7 +25,7 @@ func k(goid uint64, entryKtime uint64) Key {
 
 // 1. Entry + return, both single-fragment.
 func TestBuffer_EntryReturnSingleFragment(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 	rm := newTestMessage(4)
 
@@ -49,7 +49,7 @@ func TestBuffer_EntryReturnSingleFragment(t *testing.T) {
 
 // 2. Entry multi-fragment + return single.
 func TestBuffer_EntryMultiReturnSingle(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0 := newTestMessage(8)
 	e1 := newTestMessage(8)
 	rm := newTestMessage(4)
@@ -73,7 +73,7 @@ func TestBuffer_EntryMultiReturnSingle(t *testing.T) {
 
 // 3. Entry single + return multi-fragment.
 func TestBuffer_EntrySingleReturnMulti(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 	r0 := newTestMessage(4)
 	r1 := newTestMessage(4)
@@ -95,7 +95,7 @@ func TestBuffer_EntrySingleReturnMulti(t *testing.T) {
 
 // 4. Both multi-fragment.
 func TestBuffer_EntryReturnBothMulti(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0, e1 := newTestMessage(8), newTestMessage(8)
 	r0, r1 := newTestMessage(4), newTestMessage(4)
 
@@ -113,7 +113,7 @@ func TestBuffer_EntryReturnBothMulti(t *testing.T) {
 
 // 5. Standalone (no return) single fragment.
 func TestBuffer_StandaloneSingle(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	m := newTestMessage(16)
 	r, done := b.AddFragment(k(1, 1000), m, Entry, 0, true, false /*expectReturn*/)
 	require.True(t, done)
@@ -124,7 +124,7 @@ func TestBuffer_StandaloneSingle(t *testing.T) {
 
 // 6. Standalone multi-fragment.
 func TestBuffer_StandaloneMulti(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	m0, m1 := newTestMessage(16), newTestMessage(16)
 	_, done := b.AddFragment(k(1, 1000), m0, Entry, 0, false, false)
 	require.False(t, done)
@@ -139,7 +139,7 @@ func TestBuffer_StandaloneMulti(t *testing.T) {
 
 // 7. Entry complete; RETURN_LOST → emit entry alone.
 func TestBuffer_ReturnLost_EntryComplete(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, true)
@@ -156,7 +156,7 @@ func TestBuffer_ReturnLost_EntryComplete(t *testing.T) {
 
 // 9. RETURN_LOST arrives before entry; entry arrives later; finalize.
 func TestBuffer_ReturnLost_BeforeEntry(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	_, done := b.NoteReturnLost(k(1, 1000))
 	require.False(t, done, "no entry yet, can't finalize")
 
@@ -175,7 +175,7 @@ func TestBuffer_ReturnLost_BeforeEntry(t *testing.T) {
 // This represents: fragment 0 was sent with HasMoreFragments=true, then BPF
 // discovered it couldn't send more, so sent PARTIAL_ENTRY(last_seq=0).
 func TestBuffer_PartialEntry_ImmediateAfterFragments(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0 := newTestMessage(8)
 
 	_, done := b.AddFragment(k(1, 1000), e0, Entry, 0, false, false)
@@ -191,7 +191,7 @@ func TestBuffer_PartialEntry_ImmediateAfterFragments(t *testing.T) {
 
 // 11. Fragments 0, 1 + PARTIAL_ENTRY(last_seq=1); then return arrives → paired, entry truncated.
 func TestBuffer_PartialEntry_ThenReturn(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0, e1 := newTestMessage(8), newTestMessage(8)
 
 	_, done := b.AddFragment(k(1, 1000), e0, Entry, 0, false, true)
@@ -213,7 +213,7 @@ func TestBuffer_PartialEntry_ThenReturn(t *testing.T) {
 
 // 12. PARTIAL_ENTRY arrives before any fragments; fragments arrive later; finalize.
 func TestBuffer_PartialEntry_BeforeFragments(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	_, done := b.NotePartial(k(1, 1000), Entry, 1)
 	require.False(t, done)
 
@@ -231,7 +231,7 @@ func TestBuffer_PartialEntry_BeforeFragments(t *testing.T) {
 // 13. PARTIAL_ENTRY after fragments 0, 1 already present (both non-final) →
 //     expected = last_seq+1 = 2, so immediate finalize.
 func TestBuffer_PartialEntry_AfterFragmentsAlreadyPresent(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0, e1 := newTestMessage(8), newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), e0, Entry, 0, false, false)
 	require.False(t, done)
@@ -246,7 +246,7 @@ func TestBuffer_PartialEntry_AfterFragmentsAlreadyPresent(t *testing.T) {
 
 // 14. PARTIAL_ENTRY(last_seq=2) with only fragments 0, 1 present → wait for seq 2.
 func TestBuffer_PartialEntry_WaitForMoreFragments(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e0, e1 := newTestMessage(8), newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), e0, Entry, 0, false, false)
 	require.False(t, done)
@@ -269,7 +269,7 @@ func TestBuffer_PartialEntry_WaitForMoreFragments(t *testing.T) {
 
 // 15. Entry complete + return fragments + PARTIAL_RETURN → emit paired, truncated.
 func TestBuffer_PartialReturn_AfterFragments(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, true)
 	require.False(t, done)
@@ -289,7 +289,7 @@ func TestBuffer_PartialReturn_AfterFragments(t *testing.T) {
 
 // 16. PARTIAL_RETURN before return fragments → fragments arrive → finalize.
 func TestBuffer_PartialReturn_BeforeFragments(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, true)
 	require.False(t, done)
@@ -305,7 +305,7 @@ func TestBuffer_PartialReturn_BeforeFragments(t *testing.T) {
 
 // 17. PARTIAL_RETURN before entry; entry arrives; return arrives; finalize truncated.
 func TestBuffer_PartialReturn_BeforeEntry(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	_, done := b.NotePartial(k(1, 1000), Return, 0)
 	require.False(t, done)
 
@@ -327,7 +327,7 @@ func TestBuffer_PartialReturn_BeforeEntry(t *testing.T) {
 
 // 18. Call N entry + RETURN_LOST(N) + call N+1 entry + normal N+1 return.
 func TestBuffer_RapidReinvocation_DifferentEntryKtime(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em1 := newTestMessage(8)
 	em2 := newTestMessage(8)
 
@@ -350,7 +350,7 @@ func TestBuffer_RapidReinvocation_DifferentEntryKtime(t *testing.T) {
 
 // 19. Interleaved N and N+1 fragments in the buffer simultaneously.
 func TestBuffer_RapidReinvocation_SimultaneousInTree(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	e1a, e1b := newTestMessage(8), newTestMessage(8)
 	e2a, e2b := newTestMessage(8), newTestMessage(8)
 
@@ -380,7 +380,7 @@ func TestBuffer_RapidReinvocation_SimultaneousInTree(t *testing.T) {
 // 20. Stale notification for N arrives after N has finalized; creates a
 //     zombie entry; GC cleans up.
 func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	// Complete call N.
 	em := newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, false)
@@ -419,7 +419,7 @@ func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
 
 // 21. Single-fragment event (HasMoreFragments=false, seq=0).
 func TestBuffer_SingleFragmentStandalone(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	m := newTestMessage(8)
 	r, done := b.AddFragment(k(1, 1000), m, Entry, 0, true, false)
 	require.True(t, done)
@@ -428,7 +428,7 @@ func TestBuffer_SingleFragmentStandalone(t *testing.T) {
 
 // 22. EvictStale: entries older than maxIdle are evicted.
 func TestBuffer_EvictStale_Cutoff(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	// Oldest entry.
 	m := newTestMessage(8)
 	_, _ = b.AddFragment(k(1, 1000), m, Entry, 0, false, false)
@@ -465,7 +465,7 @@ func TestBuffer_EvictStale_Cutoff(t *testing.T) {
 // TestBuffer_Discard: the condition-failed signal path. An entry is stored
 // and then Discarded; no Ready is emitted and the message is released.
 func TestBuffer_Discard(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	em := newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, true)
 	require.False(t, done)
@@ -481,7 +481,7 @@ func TestBuffer_Discard(t *testing.T) {
 
 // 23. Close() releases everything and returns Readys for in-flight entries.
 func TestBuffer_Close(t *testing.T) {
-	b := NewBuffer()
+	b := newTestBuffer()
 	var msgs []*testMessage
 	for i := uint64(1); i < 5; i++ {
 		m := newTestMessage(8)
