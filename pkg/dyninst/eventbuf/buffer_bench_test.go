@@ -90,12 +90,13 @@ func BenchmarkBuffer_MultiFragmentPair(b *testing.B) {
 }
 
 // --------------------------------------------------------------------
-// EvictStale on a tree of N entries. This is the sink's per-event cost
-// since postMutate calls it after every HandleEvent. The threshold is
-// picked so nothing is actually evicted — we're measuring traversal.
+// EvictOlderThan on a tree of N entries. Fed by the actuator's periodic
+// poll; we measure the scan cost when no entries qualify (the common
+// case — the actuator fires it only when BPF reported a drop-notify
+// loss).
 // --------------------------------------------------------------------
 
-func BenchmarkBuffer_EvictStale_Noop(b *testing.B) {
+func BenchmarkBuffer_EvictOlderThan_Noop(b *testing.B) {
 	for _, size := range []int{1, 16, 128, 1024} {
 		b.Run(sizeName(size), func(b *testing.B) {
 			buf := newTestBuffer()
@@ -107,9 +108,9 @@ func BenchmarkBuffer_EvictStale_Noop(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				// Use a huge maxIdle so no entry qualifies for eviction —
-				// we're benchmarking the scan, not the cleanup.
-				_ = buf.EvictStale(1 << 32)
+				// Cutoff of 0 means nothing qualifies (EntryKtime starts
+				// at 1 in benchKey) — we're benchmarking the scan.
+				_ = buf.EvictOlderThan(0)
 			}
 		})
 	}

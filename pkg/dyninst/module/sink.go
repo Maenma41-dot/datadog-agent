@@ -12,6 +12,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,12 +33,6 @@ import (
 // drains. Same order of magnitude as the BPF side channel's capacity so the
 // channel almost never overflows in practice.
 const dropNotifyChanSize = 64
-
-// evictStaleMaxIdle caps how long (in buffer mutations) an in-flight entry
-// can sit without being touched before EvictStale reaps it. This is the
-// backstop for lost drop notifications or lost fragments — in the happy
-// path it never fires.
-const evictStaleMaxIdle = 1 << 12
 
 // missingTypeTracker collects type names that the decoder encounters in
 // interface values but cannot find in the IR type registry. It implements
@@ -81,9 +76,17 @@ type sink struct {
 	service      string
 	processTags  string
 	logUploader  LogsUploader
-	buffer       *eventbuf.Buffer
 	dropNotifyCh chan output.DropNotification
-	missingTypes missingTypeTracker
+
+	// mu guards buffer, missingTypes, and appliedCutoffNs. HandleEvent
+	// and HandleDropNotification arrive from the dispatcher goroutines
+	// and serialize naturally via the dropNotifyCh drain; EvictOlderThan
+	// arrives from the actuator goroutine and needs explicit
+	// synchronisation.
+	mu              sync.Mutex
+	buffer          *eventbuf.Buffer
+	missingTypes    missingTypeTracker
+	appliedCutoffNs uint64
 
 	// Probes is an ordered list of probes. The event header's probe_id is an
 	// index into this list.
@@ -117,6 +120,8 @@ func keyFromHeader(h *output.EventHeader) eventbuf.Key {
 // at the top of each call so fragment arrivals and notifications interleave
 // deterministically from the buffer's perspective.
 func (s *sink) HandleEvent(msg dispatcher.Message) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.drainDropNotifications()
 
 	ev := msg.Event()
@@ -190,7 +195,9 @@ func (s *sink) HandleDropNotification(n output.DropNotification) {
 	default:
 		// Channel full — notification lost. Same consequences as a
 		// secondary-ringbuf-full drop: userspace state for this invocation
-		// isn't promptly cleaned up, but EvictStale will reap it.
+		// isn't promptly cleaned up, but the actuator's periodic
+		// EvictOlderThan call (driven by BPF's drop_notify_lost_at signal)
+		// will eventually reap it.
 		if dropNotifyChanFullLogLimiter.Allow() {
 			log.Warnf(
 				"drop-notification channel full for program %d; reason=%d probe=%d goid=%d",
@@ -246,12 +253,27 @@ func (s *sink) processDropNotification(n output.DropNotification) {
 // postMutate runs after each buffer mutation. It drains any Readys the
 // buffer surfaced as part of budget-driven eviction (triggered when an
 // AddFragment exceeds the shared byte ceiling and forced the buffer to
-// evict its oldest entries), then runs the periodic stale-age eviction.
+// evict its oldest entries). Time-based eviction runs separately via
+// EvictOlderThan, called by the actuator.
 func (s *sink) postMutate() {
 	for _, r := range s.buffer.TakePendingBudgetEvictions() {
 		s.emit(r)
 	}
-	for _, r := range s.buffer.EvictStale(evictStaleMaxIdle) {
+}
+
+// EvictOlderThan finalizes any buffered entries whose invocation predates
+// cutoffKtimeNs. Called from the actuator goroutine when BPF reported that
+// at least one drop notification was itself lost and the grace window has
+// elapsed. The cutoff is monotonic: repeated calls with a non-increasing
+// cutoff are a no-op.
+func (s *sink) EvictOlderThan(cutoffKtimeNs uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cutoffKtimeNs <= s.appliedCutoffNs {
+		return
+	}
+	s.appliedCutoffNs = cutoffKtimeNs
+	for _, r := range s.buffer.EvictOlderThan(cutoffKtimeNs) {
 		s.emit(r)
 	}
 }
@@ -365,6 +387,8 @@ func sideFromExpectation(e output.EventPairingExpectation) (eventbuf.Side, bool)
 }
 
 func (s *sink) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.logUploader != nil {
 		s.logUploader.Close()
 	}

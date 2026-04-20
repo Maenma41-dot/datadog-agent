@@ -240,6 +240,29 @@ const ringbufMapName = "out_ringbuf"
 const defaultDropNotifyRingbufSize = 1 << 14
 const dropNotifyMapName = "drop_notify_ringbuf"
 
+// dropNotifyLostAtMapName is a single-slot BPF_MAP_TYPE_ARRAY holding the
+// most recent ktime_ns at which the BPF side failed to publish a drop
+// notification (drop_notify_ringbuf full). Userspace polls it to drive
+// eventbuf eviction. See pkg/dyninst/ebpf/scratch.h.
+const dropNotifyLostAtMapName = "drop_notify_lost_at"
+
+// DropNotifyLostAt returns the kernel-monotonic ktime_ns of the most
+// recent in-BPF attempt to publish a drop notification that failed
+// because the side-channel ringbuf was full. Returns 0 if no failure has
+// ever been recorded for this program (or if the map is unavailable).
+func (p *Program) DropNotifyLostAt() uint64 {
+	m, ok := p.Collection.Maps[dropNotifyLostAtMapName]
+	if !ok {
+		return 0
+	}
+	var key uint32
+	var val uint64
+	if err := m.Lookup(&key, &val); err != nil {
+		return 0
+	}
+	return val
+}
+
 type config struct {
 	ebpfConfig *ddebpf.Config
 

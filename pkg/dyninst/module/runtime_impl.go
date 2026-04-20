@@ -267,6 +267,14 @@ func (l *loadedProgramImpl) RuntimeStats() []loader.RuntimeStats {
 	return l.loadedProgram.RuntimeStats()
 }
 
+func (l *loadedProgramImpl) DropNotifyLostAt() uint64 {
+	return l.loadedProgram.DropNotifyLostAt()
+}
+
+func (l *loadedProgramImpl) EvictBufferOlderThan(cutoffKtimeNs uint64) {
+	l.runtime.dispatcher.EvictOlderThan(l.programID, cutoffKtimeNs)
+}
+
 func (l *loadedProgramImpl) Close() error {
 	l.loadedProgram.Close()
 	l.runtime.dispatcher.UnregisterSink(l.programID)

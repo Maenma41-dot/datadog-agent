@@ -177,12 +177,12 @@ func runSnapshotFile(t *testing.T, file string, envRewrite bool) {
 			}
 			require.NoError(t, opNode.Decode(&a))
 			b.Discard(keyFor(a.Key))
-		case "evict-stale":
+		case "evict-older-than":
 			var a struct {
-				MaxIdle uint64 `yaml:"max_idle"`
+				Cutoff uint64 `yaml:"cutoff"`
 			}
 			require.NoError(t, opNode.Decode(&a))
-			readys = b.EvictStale(a.MaxIdle)
+			readys = b.EvictOlderThan(a.Cutoff)
 		case "close":
 			readys = b.Close()
 		default:

@@ -165,8 +165,9 @@ type bufferedEvent struct {
 	// as the entry is complete; do not wait for any return fragments.
 	returnLost bool
 
-	// touch is a monotonic counter used by EvictStale to find the longest-
-	// idle entries. It is updated on every mutation.
+	// touch is a monotonic counter used by the budget-driven eviction path
+	// to find the longest-idle entry (smallest touch) to evict first when
+	// the shared Budget is saturated. It is updated on every mutation.
 	touch uint64
 
 	// bytes is the sum of event byte lengths across entry + returnList.
@@ -398,20 +399,22 @@ func (b *Buffer) NotePartial(key Key, side Side, lastSeq uint16) (Ready, bool) {
 	return b.tryFinalize(be)
 }
 
-// EvictStale finalizes every invocation that hasn't been touched within the
-// last maxIdle mutations, returning the resulting Ready values. Intended to
-// be called periodically by the caller to bound memory usage when BPF sent
-// partial fragments but a follow-up notification was lost, or vice versa.
+// EvictOlderThan finalizes every invocation whose Key.EntryKtime is less
+// than or equal to cutoffKtimeNs, returning the resulting Ready values.
+//
+// Intended for use when the BPF side reports that a drop notification was
+// itself lost: the caller, after waiting a grace window, concludes that
+// any buffered entry whose invocation predates the observed fault can no
+// longer make forward progress and should be emitted truncated.
 //
 // The returned slice may be empty. Callers own the MessageLists inside.
-func (b *Buffer) EvictStale(maxIdle uint64) []Ready {
-	if b.touchCt < maxIdle {
+func (b *Buffer) EvictOlderThan(cutoffKtimeNs uint64) []Ready {
+	if b.tree.Len() == 0 {
 		return nil
 	}
-	cutoff := b.touchCt - maxIdle
 	var toEvict []*bufferedEvent
 	b.tree.Ascend(func(be *bufferedEvent) bool {
-		if be.touch <= cutoff {
+		if be.key.EntryKtime <= cutoffKtimeNs {
 			toEvict = append(toEvict, be)
 		}
 		return true

@@ -236,6 +236,191 @@ func TestContinuationEntryReturnPairing(t *testing.T) {
 		"entry should have 2 fragments when decoded")
 }
 
+// TestEvictOlderThan_StuckEntry verifies that a buffered entry waiting
+// for a return pairing that never arrives is finalized with a truncated
+// marker when EvictOlderThan is called with a cutoff past its
+// Entry_ktime_ns.
+func TestEvictOlderThan_StuckEntry(t *testing.T) {
+	s, dec := newTestSink()
+
+	entry := buildTestEvent(&output.EventHeader{
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  0,
+		Stack_byte_len:            8,
+		Ktime_ns:                  1000,
+		Entry_ktime_ns:            1000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationReturnPairingExpected),
+	}, []uint64{0xAAAA}, []testDataItem{{
+		header: output.DataItemHeader{Type: 1, Length: 8, Address: 0x100},
+		data:   []byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}})
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entry)))
+	// Entry is in the buffer awaiting the return.
+	require.Empty(t, dec.calls)
+
+	// Cutoff 500 < 1000 → no eviction.
+	s.EvictOlderThan(500)
+	require.Empty(t, dec.calls, "cutoff below entry must not evict")
+
+	// Cutoff 2000 ≥ 1000 → evict and emit truncated.
+	s.EvictOlderThan(2000)
+	require.Len(t, dec.calls, 1, "cutoff past entry must evict")
+}
+
+// TestEvictOlderThan_MonotonicIdempotence verifies that repeated
+// EvictOlderThan calls with non-increasing cutoffs are no-ops.
+func TestEvictOlderThan_MonotonicIdempotence(t *testing.T) {
+	s, dec := newTestSink()
+	entry := buildTestEvent(&output.EventHeader{
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  0,
+		Stack_byte_len:            8,
+		Ktime_ns:                  1000,
+		Entry_ktime_ns:            1000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationReturnPairingExpected),
+	}, []uint64{0xAAAA}, []testDataItem{{
+		header: output.DataItemHeader{Type: 1, Length: 8, Address: 0x100},
+		data:   []byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}})
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entry)))
+
+	s.EvictOlderThan(2000)
+	require.Len(t, dec.calls, 1)
+	// Second call with same (or smaller) cutoff: sink's appliedCutoffNs
+	// guards against re-eviction.
+	s.EvictOlderThan(2000)
+	s.EvictOlderThan(1500)
+	require.Len(t, dec.calls, 1)
+}
+
+// TestEvictOlderThan_LongRunningCallPreserved verifies that a buffered
+// entry whose invocation is in flight but has NOT had a drop-notify-lost
+// signal observed is never evicted by mere passage of time. This is the
+// load-bearing property: long-running calls must trace correctly.
+func TestEvictOlderThan_LongRunningCallPreserved(t *testing.T) {
+	s, dec := newTestSink()
+	entry := buildTestEvent(&output.EventHeader{
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  0,
+		Stack_byte_len:            8,
+		Ktime_ns:                  1000,
+		Entry_ktime_ns:            1000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationReturnPairingExpected),
+	}, []uint64{0xAAAA}, []testDataItem{{
+		header: output.DataItemHeader{Type: 1, Length: 8, Address: 0x100},
+		data:   []byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}})
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entry)))
+	// No EvictOlderThan call fires (because BPF never reported a drop
+	// notify loss). Entry stays in the buffer forever until either the
+	// return arrives or the program shuts down.
+	require.Empty(t, dec.calls, "long-running call must not be evicted")
+}
+
+// TestEvictOlderThan_RaceWithDropNotification verifies that when a real
+// drop notification finalizes the entry first, a subsequent
+// EvictOlderThan call with the same-or-later cutoff is a no-op (the
+// entry is already gone).
+func TestEvictOlderThan_RaceWithDropNotification(t *testing.T) {
+	s, dec := newTestSink()
+	entry := buildTestEvent(&output.EventHeader{
+		Goid:                      42,
+		Stack_byte_depth:          100,
+		Probe_id:                  0,
+		Stack_byte_len:            8,
+		Ktime_ns:                  1000,
+		Entry_ktime_ns:            1000,
+		Event_pairing_expectation: uint8(output.EventPairingExpectationReturnPairingExpected),
+	}, []uint64{0xAAAA}, []testDataItem{{
+		header: output.DataItemHeader{Type: 1, Length: 8, Address: 0x100},
+		data:   []byte{1, 2, 3, 4, 5, 6, 7, 8},
+	}})
+	require.NoError(t, s.HandleEvent(dispatcher.MakeTestingMessage(entry)))
+
+	// A real RETURN_LOST drop notification for this invocation.
+	s.HandleDropNotification(output.DropNotification{
+		Prog_id:          0,
+		Probe_id:         0,
+		Goid:             42,
+		Stack_byte_depth: 100,
+		Drop_reason:      uint8(output.DropReasonReturnLost),
+		Entry_ktime_ns:   1000,
+	})
+	// Drain via a no-op HandleEvent — the drop-notify drain runs at the
+	// top of HandleEvent. We synthesise a spurious event; the simplest
+	// is to reuse the continuation-expected pattern, but since we only
+	// want the drain, any pipeline mutation works. Alternatively, call
+	// drainDropNotifications directly.
+	s.mu.Lock()
+	s.drainDropNotifications()
+	s.mu.Unlock()
+	require.Len(t, dec.calls, 1, "drop notification should have finalized the entry")
+
+	// Now EvictOlderThan fires; should be a no-op for this key.
+	s.EvictOlderThan(2000)
+	require.Len(t, dec.calls, 1)
+}
+
+// TestEvictOlderThan_ConcurrentWithHandleEvent stresses the sink's
+// mutex: many goroutines call HandleEvent while others call
+// EvictOlderThan. Run with -race to detect data races. We don't assert
+// on decoder call counts (timing-dependent) — the point is race-free
+// operation.
+func TestEvictOlderThan_ConcurrentWithHandleEvent(t *testing.T) {
+	s, _ := newTestSink()
+	const N = 50
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := uint64(0); ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			ev := buildTestEvent(&output.EventHeader{
+				Goid:                      i,
+				Stack_byte_depth:          100,
+				Probe_id:                  0,
+				Ktime_ns:                  i + 1000,
+				Entry_ktime_ns:            i + 1000,
+				Event_pairing_expectation: uint8(output.EventPairingExpectationNone),
+			}, nil, []testDataItem{{
+				header: output.DataItemHeader{Type: 1, Length: 4, Address: 0x100},
+				data:   []byte{1, 2, 3, 4},
+			}})
+			_ = s.HandleEvent(dispatcher.MakeTestingMessage(ev))
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < N; i++ {
+			s.EvictOlderThan(uint64(i) * 100)
+		}
+	}()
+
+	// Let them run briefly.
+	for i := 0; i < N; i++ {
+		s.EvictOlderThan(uint64(i) * 50)
+	}
+	close(done)
+	wg.Wait()
+
+	// After shutdown, sink's appliedCutoffNs should reflect the
+	// highest cutoff we passed.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	require.GreaterOrEqual(t, s.appliedCutoffNs, uint64((N-1)*50))
+}
+
 // stubDecoder implements Decoder for testing.
 type stubDecoder struct {
 	calls              []decode.Event

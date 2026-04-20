@@ -45,11 +45,27 @@ struct {
   __uint(max_entries, DROP_NOTIFY_RINGBUF_CAPACITY);
 } drop_notify_ringbuf SEC(".maps");
 
+// drop_notify_lost_at records the kernel-monotonic ktime_ns of the most
+// recent attempt to publish a drop notification that failed because the
+// drop_notify_ringbuf was itself full. Userspace reads this value on its
+// periodic stats poll; when it increases, and once the value has been in
+// the past for longer than a grace window, userspace evicts buffered
+// eventbuf entries whose invocation predates the fault.
+//
+// Writes are lossy (last-writer wins across CPUs); the semantics we want
+// are "some CPU saw a failure at-or-after this time", so racing writes
+// simply converge to the latest ktime.
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, uint32_t);
+  __type(value, uint64_t);
+} drop_notify_lost_at SEC(".maps");
+
 // send_drop_notification publishes a drop notification to the side channel.
-// It is best-effort: if drop_notify_ringbuf is itself full, the notification
-// is lost. In that case the affected invocation's tree entry remains in
-// userspace's buffer until a later eviction path handles it. Userspace's
-// last-touch GC (future commit) is the eventual backstop.
+// On failure (drop_notify_ringbuf full), stamps drop_notify_lost_at with
+// the current ktime so userspace can later reconcile the stuck eventbuf
+// entry.
 static inline void send_drop_notification(
     uint32_t prog_id,
     uint32_t probe_id,
@@ -67,7 +83,14 @@ static inline void send_drop_notification(
       .last_seq = last_seq,
       .entry_ktime_ns = entry_ktime_ns,
   };
-  bpf_ringbuf_output(&drop_notify_ringbuf, &notif, sizeof(notif), 0);
+  if (bpf_ringbuf_output(&drop_notify_ringbuf, &notif, sizeof(notif), 0) !=
+      0) {
+    uint32_t zero = 0;
+    uint64_t* slot = bpf_map_lookup_elem(&drop_notify_lost_at, &zero);
+    if (slot) {
+      *slot = bpf_ktime_get_ns();
+    }
+  }
 }
 
 // A helper to check if the scratch buffer has enough space.

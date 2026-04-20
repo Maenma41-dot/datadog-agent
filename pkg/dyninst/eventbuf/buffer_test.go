@@ -378,10 +378,10 @@ func TestBuffer_RapidReinvocation_SimultaneousInTree(t *testing.T) {
 }
 
 //  20. Stale notification for N arrives after N has finalized; creates a
-//     zombie entry; GC cleans up.
-func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
+//     zombie entry; EvictOlderThan with a later ktime cleans it up.
+func TestBuffer_StaleNotification_GCedByEvictOlderThan(t *testing.T) {
 	b := newTestBuffer()
-	// Complete call N.
+	// Complete call N (entryKtime=1000).
 	em := newTestMessage(8)
 	_, done := b.AddFragment(k(1, 1000), em, Entry, 0, true, false)
 	require.True(t, done)
@@ -391,15 +391,9 @@ func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
 	require.False(t, done, "no fragments means can't finalize")
 	assert.Equal(t, 1, b.Len(), "zombie entry persists")
 
-	// Issue a bunch of mutations on other keys to move the touchCt forward.
-	for i := uint64(100); i < 110; i++ {
-		m := newTestMessage(8)
-		_, _ = b.AddFragment(k(i, i*10), m, Entry, 0, true, false)
-	}
-
-	// Evict stale entries older than maxIdle=5.
-	evicted := b.EvictStale(5)
-	// The zombie should be evicted (it's at touch=1, touchCt is now 12).
+	// Evict entries whose EntryKtime <= 1000: the zombie has key
+	// EntryKtime=1000, so it qualifies.
+	evicted := b.EvictOlderThan(1000)
 	require.NotEmpty(t, evicted)
 	found := false
 	for _, r := range evicted {
@@ -411,6 +405,7 @@ func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "zombie entry should have been evicted")
+	assert.Equal(t, 0, b.Len())
 }
 
 // ------------------------------------------------------------------
@@ -426,24 +421,18 @@ func TestBuffer_SingleFragmentStandalone(t *testing.T) {
 	r.Entry.Release()
 }
 
-// 22. EvictStale: entries older than maxIdle are evicted.
-func TestBuffer_EvictStale_Cutoff(t *testing.T) {
+// 22. EvictOlderThan: entries whose EntryKtime <= cutoff are evicted.
+func TestBuffer_EvictOlderThan_Cutoff(t *testing.T) {
 	b := newTestBuffer()
-	// Oldest entry.
-	m := newTestMessage(8)
-	_, _ = b.AddFragment(k(1, 1000), m, Entry, 0, false, false)
-
-	// A bunch of newer mutations.
-	for i := uint64(2); i < 10; i++ {
+	// Five entries at entryKtime 1000, 2000, 3000, 4000, 5000.
+	for i := uint64(1); i <= 5; i++ {
 		mm := newTestMessage(4)
 		_, _ = b.AddFragment(k(i, i*1000), mm, Entry, 0, false, false)
 	}
 
-	// Evict entries not touched in the last 5 mutations.
-	evicted := b.EvictStale(5)
-	// The first entry is touched at touchCt=1, current is 9.
-	// cutoff = 9 - 5 = 4 => evict entries with touch <= 4.
-	// Entries 1, 2, 3, 4 should be evicted.
+	// Cutoff 3500: expect entries at 1000, 2000, 3000 evicted; 4000
+	// and 5000 remain.
+	evicted := b.EvictOlderThan(3500)
 	keys := make(map[Key]bool)
 	for _, r := range evicted {
 		keys[r.Key] = true
@@ -454,12 +443,64 @@ func TestBuffer_EvictStale_Cutoff(t *testing.T) {
 	assert.True(t, keys[k(1, 1000)])
 	assert.True(t, keys[k(2, 2000)])
 	assert.True(t, keys[k(3, 3000)])
-	assert.True(t, keys[k(4, 4000)])
-	// Entries 5..9 should still be in the buffer.
-	for _, r := range evicted {
-		assert.NotEqual(t, k(5, 5000), r.Key)
-		assert.NotEqual(t, k(9, 9000), r.Key)
+	assert.False(t, keys[k(4, 4000)])
+	assert.False(t, keys[k(5, 5000)])
+	assert.Equal(t, 2, b.Len(), "entries 4 and 5 remain")
+}
+
+// EvictOlderThan with an empty buffer is a no-op.
+func TestBuffer_EvictOlderThan_Empty(t *testing.T) {
+	b := newTestBuffer()
+	assert.Nil(t, b.EvictOlderThan(1000))
+}
+
+// EvictOlderThan when all entries are newer than the cutoff returns nil.
+func TestBuffer_EvictOlderThan_AllNewer(t *testing.T) {
+	b := newTestBuffer()
+	m := newTestMessage(8)
+	_, _ = b.AddFragment(k(1, 5000), m, Entry, 0, false, false)
+	assert.Nil(t, b.EvictOlderThan(1000))
+	assert.Equal(t, 1, b.Len())
+}
+
+// EvictOlderThan is inclusive: an entry with EntryKtime == cutoff is
+// evicted.
+func TestBuffer_EvictOlderThan_BoundaryInclusive(t *testing.T) {
+	b := newTestBuffer()
+	m := newTestMessage(8)
+	_, _ = b.AddFragment(k(1, 1000), m, Entry, 0, false, false)
+	ev := b.EvictOlderThan(1000)
+	require.Len(t, ev, 1)
+	if ev[0].Entry != nil {
+		ev[0].Entry.Release()
 	}
+	assert.Equal(t, 0, b.Len())
+}
+
+// Repeated EvictOlderThan calls with increasing cutoffs evict in waves
+// without double-emitting.
+func TestBuffer_EvictOlderThan_RepeatedWaves(t *testing.T) {
+	b := newTestBuffer()
+	for i := uint64(1); i <= 5; i++ {
+		mm := newTestMessage(4)
+		_, _ = b.AddFragment(k(i, i*1000), mm, Entry, 0, false, false)
+	}
+	first := b.EvictOlderThan(2500)
+	for _, r := range first {
+		if r.Entry != nil {
+			r.Entry.Release()
+		}
+	}
+	assert.Len(t, first, 2)
+
+	second := b.EvictOlderThan(4500)
+	for _, r := range second {
+		if r.Entry != nil {
+			r.Entry.Release()
+		}
+	}
+	assert.Len(t, second, 2)
+	assert.Equal(t, 1, b.Len(), "only the k=5,5000 entry remains")
 }
 
 // TestBuffer_Discard: the condition-failed signal path. An entry is stored

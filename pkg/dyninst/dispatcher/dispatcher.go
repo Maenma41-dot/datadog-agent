@@ -36,6 +36,14 @@ type Sink interface {
 	// relative to HandleEvent.
 	HandleDropNotification(output.DropNotification)
 
+	// EvictOlderThan asks the sink to finalize any buffered entries whose
+	// invocation predates cutoffKtimeNs (in the bpf_ktime_get_ns domain).
+	// Called from the actuator goroutine when BPF reported that a drop
+	// notification was itself lost and a grace window has elapsed. The
+	// sink applies its own monotonic check, so callers may invoke this
+	// freely with the latest cutoff on each stats poll.
+	EvictOlderThan(cutoffKtimeNs uint64)
+
 	// Close will be called when the sink is no longer needed.
 	Close()
 }
@@ -158,6 +166,17 @@ func (d *Dispatcher) UnregisterSink(progID ir.ProgramID) {
 	if s != nil {
 		s.Close()
 	}
+}
+
+// EvictOlderThan forwards an eviction request to the sink registered for
+// progID, if any. Returns without error if the sink is not registered —
+// the program may have been unregistered concurrently.
+func (d *Dispatcher) EvictOlderThan(progID ir.ProgramID, cutoffKtimeNs uint64) {
+	sink, ok := d.getSink(progID)
+	if !ok {
+		return
+	}
+	sink.EvictOlderThan(cutoffKtimeNs)
 }
 
 // flushAndWait triggers a flush of the ringbuffer reader and waits until the

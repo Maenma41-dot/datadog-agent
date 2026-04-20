@@ -33,7 +33,7 @@ const (
 	opNoteReturnLost
 	opNotePartial
 	opDiscard
-	opEvictStale
+	opEvictOlderThan
 	opClose
 )
 
@@ -55,8 +55,8 @@ type op struct {
 	npartialSide Side
 	nlastSeq     uint16
 
-	// For opEvictStale
-	maxIdle uint64
+	// For opEvictOlderThan
+	cutoffKtime uint64
 }
 
 func (o op) String() string {
@@ -73,8 +73,8 @@ func (o op) String() string {
 			o.nkey, o.npartialSide, o.nlastSeq)
 	case opDiscard:
 		return fmt.Sprintf("Discard(key=%+v)", o.nkey)
-	case opEvictStale:
-		return fmt.Sprintf("EvictStale(%d)", o.maxIdle)
+	case opEvictOlderThan:
+		return fmt.Sprintf("EvictOlderThan(%d)", o.cutoffKtime)
 	case opClose:
 		return "Close()"
 	}
@@ -159,9 +159,9 @@ func runProperty(seed uint64, numOps int) error {
 		s := states[r.Key]
 		if s == nil {
 			// Ready emitted for a key we didn't touch. That can happen when
-			// EvictStale / Close processes a zombie created by a notification
-			// alone. We allow it; validate flags against whatever state we
-			// have (none), which is vacuously fine.
+			// EvictOlderThan / Close processes a zombie created by a
+			// notification alone. We allow it; validate flags against
+			// whatever state we have (none), which is vacuously fine.
 			return nil
 		}
 		if s.finalized {
@@ -199,8 +199,8 @@ func runProperty(seed uint64, numOps int) error {
 
 		// Entry / Return list presence must match what we fed in. This
 		// property is tight in normal finalize but loose for forced finalize
-		// (EvictStale/Close can emit a zombie entry with no fragments, e.g.
-		// when only a notification arrived).
+		// (EvictOlderThan/Close can emit a zombie entry with no fragments,
+		// e.g. when only a notification arrived).
 		if r.Entry != nil && len(s.entryMsgs) == 0 && !forced {
 			return fmt.Errorf(
 				"Ready.Entry != nil for key %+v with no entry fragments added\ntrace:\n%s",
@@ -312,8 +312,8 @@ func runProperty(seed uint64, numOps int) error {
 				s.discarded = true
 			}
 			b.Discard(o.nkey)
-		case opEvictStale:
-			for _, r := range b.EvictStale(o.maxIdle) {
+		case opEvictOlderThan:
+			for _, r := range b.EvictOlderThan(o.cutoffKtime) {
 				if err := applyReady(r, true /*forced*/, trace); err != nil {
 					return err
 				}
@@ -385,7 +385,12 @@ func genOp(rng *rand.Rand, keys []Key, forceClose bool) op {
 	case x < 85:
 		return op{kind: opDiscard, nkey: k}
 	case x < 95:
-		return op{kind: opEvictStale, maxIdle: uint64(rng.IntN(32))}
+		// Pick a cutoff in the range of the key EntryKtimes (1000..N*1000)
+		// so both "some evicted" and "none evicted" paths get coverage.
+		return op{
+			kind:        opEvictOlderThan,
+			cutoffKtime: uint64(rng.IntN(len(keys)+2)) * 1000,
+		}
 	default:
 		return op{kind: opClose}
 	}
