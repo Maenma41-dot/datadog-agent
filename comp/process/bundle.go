@@ -45,7 +45,7 @@ func Bundle() fxutil.BundleOptions {
 		// Checks
 		connectionscheckimpl.Module(),
 		containercheckfx.Module(),
-		processcheckimpl.Module(),
+		processcheckfx.Module(),
 		rtcontainercheckimpl.Module(),
 		processdiscoverycheckimpl.Module(),
 
