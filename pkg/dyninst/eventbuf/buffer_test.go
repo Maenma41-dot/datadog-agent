@@ -228,7 +228,7 @@ func TestBuffer_PartialEntry_BeforeFragments(t *testing.T) {
 	r.Entry.Release()
 }
 
-// 13. PARTIAL_ENTRY after fragments 0, 1 already present (both non-final) →
+//  13. PARTIAL_ENTRY after fragments 0, 1 already present (both non-final) →
 //     expected = last_seq+1 = 2, so immediate finalize.
 func TestBuffer_PartialEntry_AfterFragmentsAlreadyPresent(t *testing.T) {
 	b := newTestBuffer()
@@ -377,7 +377,7 @@ func TestBuffer_RapidReinvocation_SimultaneousInTree(t *testing.T) {
 	assert.Equal(t, 0, b.Len())
 }
 
-// 20. Stale notification for N arrives after N has finalized; creates a
+//  20. Stale notification for N arrives after N has finalized; creates a
 //     zombie entry; GC cleans up.
 func TestBuffer_StaleNotification_GCedByEvictStale(t *testing.T) {
 	b := newTestBuffer()

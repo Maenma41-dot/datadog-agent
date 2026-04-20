@@ -151,10 +151,10 @@ type bufferedEvent struct {
 	entryExpected  uint16
 	entryTruncated bool
 
-	returnList       *MessageList
-	returnFragments  uint16
-	returnExpected   uint16
-	returnTruncated  bool
+	returnList      *MessageList
+	returnFragments uint16
+	returnExpected  uint16
+	returnTruncated bool
 
 	// expectReturn is true when we've learned this invocation has a return
 	// (either from an entry fragment's pairing expectation or from a
@@ -173,13 +173,6 @@ type bufferedEvent struct {
 	// Maintained incrementally on AddFragment / releaseLists so the Budget
 	// can charge/credit without walking the fragment chain.
 	bytes int
-
-	// finalized is set when Ready has been emitted for this key. Further
-	// mutations via the normal path create a fresh entry (implicitly: the
-	// old one has been removed). This flag is only reached if Close()
-	// iterates a post-finalize entry; in normal operation the entry is
-	// gone from the tree.
-	finalized bool
 }
 
 // Buffer is the userspace-side event reassembly and pairing buffer.

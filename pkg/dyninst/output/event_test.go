@@ -364,38 +364,38 @@ func TestEventIterator(t *testing.T) {
 
 func TestContinuationFlags(t *testing.T) {
 	tests := []struct {
-		name            string
-		seq             uint16
-		flags           uint8
-		isContinuation  bool
+		name             string
+		seq              uint16
+		flags            uint8
+		isContinuation   bool
 		hasMoreFragments bool
 	}{
 		{
-			name:            "legacy single event",
-			seq:             0,
-			flags:           0,
-			isContinuation:  false,
+			name:             "legacy single event",
+			seq:              0,
+			flags:            0,
+			isContinuation:   false,
 			hasMoreFragments: false,
 		},
 		{
-			name:            "first fragment with more",
-			seq:             0,
-			flags:           ContinuationFlagMore,
-			isContinuation:  true,
+			name:             "first fragment with more",
+			seq:              0,
+			flags:            ContinuationFlagMore,
+			isContinuation:   true,
 			hasMoreFragments: true,
 		},
 		{
-			name:            "middle fragment",
-			seq:             1,
-			flags:           ContinuationFlagMore,
-			isContinuation:  true,
+			name:             "middle fragment",
+			seq:              1,
+			flags:            ContinuationFlagMore,
+			isContinuation:   true,
 			hasMoreFragments: true,
 		},
 		{
-			name:            "final fragment",
-			seq:             2,
-			flags:           0,
-			isContinuation:  true,
+			name:             "final fragment",
+			seq:              2,
+			flags:            0,
+			isContinuation:   true,
 			hasMoreFragments: false,
 		},
 	}

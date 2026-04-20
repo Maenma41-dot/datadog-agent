@@ -244,7 +244,7 @@ type stubDecoder struct {
 }
 
 func (d *stubDecoder) Decode(
-	event decode.Event, _ symbol.Symbolicator, _ decode.MissingTypeCollector, out []byte,
+	event decode.Event, _ symbol.Symbolicator, _ decode.MissingTypeCollector, _ []byte,
 ) ([]byte, ir.ProbeDefinition, error) {
 	d.calls = append(d.calls, event)
 	if d.onDecode != nil {

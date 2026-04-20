@@ -95,7 +95,6 @@ var _ dispatcher.Sink = &sink{}
 // about them and we don't want to bail out completely.
 var decodingErrorLogLimiter = rate.NewLimiter(rate.Every(1*time.Minute), 10)
 
-var noMatchingEventLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingCallMapFullLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingCallCountExceededLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
 var eventPairingConditionFailedLogLimiter = rate.NewLimiter(rate.Every(10*time.Minute), 10)
@@ -379,4 +378,3 @@ func (s *sink) Close() {
 		s.emit(r)
 	}
 }
-

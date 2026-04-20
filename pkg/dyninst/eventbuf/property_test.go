@@ -443,4 +443,3 @@ func TestBuffer_PropertyLongerTraces(t *testing.T) {
 		}
 	}
 }
-
