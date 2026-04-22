@@ -18,12 +18,12 @@
           {
             "function": "main.condLine",
             "fileName": "github.com/DataDog/datadog-agent/pkg/dyninst/testprogs/progs/simple/main.go",
-            "lineNumber": 501
+            "lineNumber": 515
           },
           {
             "function": "main.main",
             "fileName": "github.com/DataDog/datadog-agent/pkg/dyninst/testprogs/progs/simple/main.go",
-            "lineNumber": 113
+            "lineNumber": 114
           },
           {
             "function": "runtime.main",
@@ -41,12 +41,12 @@
           "location": {
             "method": "main.condLine",
             "file": "main.go",
-            "line": 501
+            "line": 515
           }
         },
         "captures": {
           "lines": {
-            "501": {
+            "515": {
               "captureExpressions": {
                 "tag_val": {
                   "type": "string",
