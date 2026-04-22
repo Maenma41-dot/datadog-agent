@@ -36,7 +36,7 @@ const (
 type ExecutionResult struct {
 	Status   string
 	Message  string
-	Payloads map[string]interface{}
+	Payloads map[string][]byte
 }
 
 // ActionExecutor is the interface that all action executors must implement

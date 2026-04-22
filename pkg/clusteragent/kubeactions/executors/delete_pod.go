@@ -12,9 +12,10 @@ import (
 	"fmt"
 
 	kubeactions "github.com/DataDog/agent-payload/v5/kubeactions"
-	"github.com/DataDog/datadog-agent/pkg/util/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/DataDog/datadog-agent/pkg/util/log"
 )
 
 // Execution status constants
@@ -27,13 +28,15 @@ const (
 type ExecutionResult struct {
 	Status   string
 	Message  string
-	Payloads map[string]interface{}
+	Payloads map[string][]byte
 }
 
 // DeletePodExecutor executes delete pod actions
 type DeletePodExecutor struct {
 	clientset kubernetes.Interface
 }
+
+var _ Executor = (*DeletePodExecutor)(nil)
 
 // NewDeletePodExecutor creates a new DeletePodExecutor
 func NewDeletePodExecutor(clientset kubernetes.Interface) *DeletePodExecutor {

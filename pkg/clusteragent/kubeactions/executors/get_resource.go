@@ -8,7 +8,9 @@
 package executors
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -29,6 +31,14 @@ const (
 type GetResourceExecutor struct {
 	clientset kubernetes.Interface
 }
+
+// Ensure interface compliance at compile time
+var _ Executor = (*GetResourceExecutor)(nil)
+
+var (
+	// ErrUnsupportedFormat is returned when the requested output format is not supported
+	ErrUnsupportedFormat = errors.New("unsupported output format")
+)
 
 // NewGetResourceExecutor creates a new GetResourceExecutor
 func NewGetResourceExecutor(clientset kubernetes.Interface) *GetResourceExecutor {
@@ -96,9 +106,9 @@ func (e *GetResourceExecutor) Execute(ctx context.Context, action *kubeactions.K
 	}
 
 	outputFormat := "json"
-	// if output := action.GetGetResource_().GetOutputFormat(); output != "" {
-	// 	outputFormat = strings.ToLower(output)
-	// }
+	if output := action.GetGetResource_().GetOutputFormat(); output != "" {
+		outputFormat = strings.ToLower(output)
+	}
 
 	output, err := formatOutput(data, outputFormat)
 	if err != nil {
@@ -108,29 +118,29 @@ func (e *GetResourceExecutor) Execute(ctx context.Context, action *kubeactions.K
 		}
 	}
 
-	output = strings.TrimSpace(output)[:maxResourceOutputSize]
+	output = bytes.TrimSpace(output)[:maxResourceOutputSize]
 
 	return ExecutionResult{
 		Status:  StatusSuccess,
 		Message: fmt.Sprintf("get resource %s/%s success", kind, name),
-		Payloads: map[string]interface{}{
-			"resource": output,
+		Payloads: map[string][]byte{
+			"resource": []byte(output),
 		},
 	}
 }
 
-func formatOutput(data []byte, format string) (string, error) {
+func formatOutput(data []byte, format string) ([]byte, error) {
 	switch format {
 	case "json":
-		return string(data), nil
+		return data, nil
 	case "yaml":
 		jsonData := data
 		yamlData, err := yaml.JSONToYAML(jsonData)
 		if err != nil {
-			return "", fmt.Errorf("failed to convert resource JSON to YAML: %v", err)
+			return nil, fmt.Errorf("failed to convert resource JSON to YAML: %v", err)
 		}
-		return string(yamlData), nil
+		return yamlData, nil
 	default:
-		return "", fmt.Errorf("unsupported output format: %s", format)
+		return nil, ErrUnsupportedFormat
 	}
 }
