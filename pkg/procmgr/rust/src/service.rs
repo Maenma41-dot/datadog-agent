@@ -37,7 +37,10 @@ use crate::platform;
 use crate::uuid_gen::V4UuidGenerator;
 
 const SERVICE_NAME: &str = "dd-procmgr-service";
-const HARD_STOP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Must exceed `DEFAULT_STOP_TIMEOUT_SECS` (90s) + `EXIT_GATE` so that
+/// `ProcessManager::shutdown` can finish gracefully and force-kill any
+/// stubborn children before we hard-exit.
+const HARD_STOP_TIMEOUT: Duration = Duration::from_secs(100);
 const EXIT_GATE: Duration = Duration::from_secs(5);
 
 /// Global status handle set by `service_main` before use in the control handler.
