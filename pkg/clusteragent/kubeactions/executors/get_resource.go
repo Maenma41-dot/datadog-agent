@@ -118,7 +118,11 @@ func (e *GetResourceExecutor) Execute(ctx context.Context, action *kubeactions.K
 		}
 	}
 
-	output = bytes.TrimSpace(output)[:maxResourceOutputSize]
+	output = bytes.TrimSpace(output)
+	if len(output) > maxResourceOutputSize {
+		log.Warnf("output for resource %s/%s of type %s is too large (%d bytes), truncating to %d bytes", namespace, name, kind, len(output), maxResourceOutputSize)
+		output = output[:maxResourceOutputSize]
+	}
 
 	return ExecutionResult{
 		Status:  StatusSuccess,
