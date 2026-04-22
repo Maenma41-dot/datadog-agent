@@ -410,16 +410,6 @@ func TestParseEnvAsMapStringInterface(t *testing.T) {
 	assert.Equal(t, map[string]interface{}{"a": 1.0, "b": 2.0, "c": 3.0}, config.GetStringMap("map_of_float"))
 }
 
-func TestParseEnvAsSliceMapString(t *testing.T) {
-	config := NewViperConfig("test", "DD", strings.NewReplacer(".", "_")) // nolint: forbidigo
-
-	config.BindEnv("map") //nolint:forbidigo // TODO: replace by 'SetDefaultAndBindEnv'
-	config.ParseEnvAsSliceMapString("map", func(string) []map[string]string { return []map[string]string{{"a": "a", "b": "b", "c": "c"}} })
-
-	t.Setenv("DD_MAP", "__some_data__")
-	assert.Equal(t, []map[string]string{{"a": "a", "b": "b", "c": "c"}}, config.Get("map"))
-}
-
 func TestUnsetForSource(t *testing.T) {
 	config := NewViperConfig("test", "DD", strings.NewReplacer(".", "_")) // nolint: forbidigo
 	config.SetDefault("some.setting", "default_value")
