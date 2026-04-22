@@ -15,8 +15,8 @@
 //! down without any API changes.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,10 +26,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOPPED,
-    SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
-    SetServiceStatus, StartServiceCtrlDispatcherW,
+    SERVICE_CONTROL_INTERROGATE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STOP_PENDING, SERVICE_STOPPED,
+    SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS, SetServiceStatus, StartServiceCtrlDispatcherW,
 };
 
 use crate::config::YamlConfigLoader;
@@ -83,7 +82,12 @@ unsafe extern "system" fn ctrl_handler(
 ) -> u32 {
     match control {
         SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            set_service_status(SERVICE_STOP_PENDING, 0, NO_ERROR, HARD_STOP_TIMEOUT.as_millis() as u32);
+            set_service_status(
+                SERVICE_STOP_PENDING,
+                0,
+                NO_ERROR,
+                HARD_STOP_TIMEOUT.as_millis() as u32,
+            );
             platform::shutdown_notify().notify_one();
 
             std::thread::spawn(|| {
@@ -103,11 +107,8 @@ unsafe extern "system" fn ctrl_handler(
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     let name = service_name_wide();
 
-    let handle = RegisterServiceCtrlHandlerExW(
-        name.as_ptr(),
-        Some(ctrl_handler),
-        std::ptr::null_mut(),
-    );
+    let handle =
+        RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), std::ptr::null_mut());
     if handle == 0 {
         error!("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
         return;
