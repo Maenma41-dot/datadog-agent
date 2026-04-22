@@ -980,6 +980,9 @@ func initCoreAgentFull(config pkgconfigmodel.Setup) {
 	// Private Action Runner configuration
 	setupPrivateActionRunner(config)
 
+	// Process Manager configuration
+	setupProcmgr(config)
+
 	// Installer configuration
 	config.BindEnvAndSetDefault("remote_updates", true)
 	config.BindEnvAndSetDefault("installer.mirror", "")

@@ -19,6 +19,7 @@ go_library(
         "otlp.go",
         "privateactionrunner.go",
         "process.go",
+        "procmgr.go",
         "security_agent.go",
         "standard_names.go",
         "system_probe.go",
