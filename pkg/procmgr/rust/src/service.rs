@@ -16,7 +16,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -44,7 +44,8 @@ const HARD_STOP_TIMEOUT: Duration = Duration::from_secs(100);
 const EXIT_GATE: Duration = Duration::from_secs(5);
 
 /// Global status handle set by `service_main` before use in the control handler.
-static STATUS_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// On the GNU ABI `SERVICE_STATUS_HANDLE` is `*mut c_void`, not `isize`.
+static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Encode `SERVICE_NAME` as a null-terminated UTF-16 slice at compile time.
 /// `StartServiceCtrlDispatcherW` and `RegisterServiceCtrlHandlerExW` require
@@ -58,7 +59,7 @@ fn service_name_wide() -> Vec<u16> {
 
 fn set_service_status(state: u32, controls: u32, exit_code: u32, wait_hint_ms: u32) {
     let handle = STATUS_HANDLE.load(Ordering::SeqCst);
-    if handle == 0 {
+    if handle.is_null() {
         return;
     }
     let mut status = SERVICE_STATUS {
@@ -112,7 +113,7 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
 
     let handle =
         RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), std::ptr::null_mut());
-    if handle == 0 {
+    if handle.is_null() {
         error!("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
         return;
     }
