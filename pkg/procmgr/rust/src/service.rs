@@ -62,7 +62,7 @@ fn set_service_status(state: u32, controls: u32, exit_code: u32, wait_hint_ms: u
     if handle.is_null() {
         return;
     }
-    let mut status = SERVICE_STATUS {
+    let status = SERVICE_STATUS {
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: state,
         dwControlsAccepted: controls,
@@ -72,7 +72,7 @@ fn set_service_status(state: u32, controls: u32, exit_code: u32, wait_hint_ms: u
         dwWaitHint: wait_hint_ms,
     };
     unsafe {
-        SetServiceStatus(handle, &mut status);
+        SetServiceStatus(handle, &status);
     }
 }
 
@@ -111,10 +111,14 @@ unsafe extern "system" fn ctrl_handler(
 unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
     let name = service_name_wide();
 
-    let handle =
-        RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), std::ptr::null_mut());
+    let handle = unsafe {
+        RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), std::ptr::null_mut())
+    };
     if handle.is_null() {
-        error!("RegisterServiceCtrlHandlerExW failed: {}", GetLastError());
+        error!(
+            "RegisterServiceCtrlHandlerExW failed: {}",
+            unsafe { GetLastError() }
+        );
         return;
     }
     STATUS_HANDLE.store(handle, Ordering::SeqCst);
