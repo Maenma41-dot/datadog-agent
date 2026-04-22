@@ -282,9 +282,10 @@ func (p *ProcessKiller) KillAndReport(kill *rules.KillDefinition, rule *rules.Ru
 	}
 	// kill the processes
 	killedAt := time.Now() // get the current time now to make sure it precedes any process exit time
-	failedPids, nbOfKilled := p.KillProcesses(true, rule.ID, sig, pcs)
-	updateKillActionReport(report, killedAt, failedPids, nbOfKilled)
-	if len(failedPids) > 0 && nbOfKilled > 0 {
+	failedPids, killedPids := p.KillProcesses(true, rule.ID, sig, pcs)
+	// there is only one report here so nbOfKilled is enough
+	updateKillActionReport(report, killedAt, failedPids, killedPids)
+	if len(failedPids) > 0 && len(killedPids) > 0 {
 		log.Warn("some processes failed to be killed with PIDs: ", failedPids)
 	}
 	p.registerReport(report, ev)
@@ -292,10 +293,11 @@ func (p *ProcessKiller) KillAndReport(kill *rules.KillDefinition, rule *rules.Ru
 }
 
 // KillProcesses kills the given list of processes, returns the list of pids that failed to be killed (nil if everything went well)
-func (p *ProcessKiller) KillProcesses(killDirectly bool, ruleID string, sig int, kcs []killContext) ([]uint32, int64) {
-	var failedToKillPids []uint32
+func (p *ProcessKiller) KillProcesses(killDirectly bool, ruleID string, sig int, kcs []killContext) ([]uint32, []uint32) {
+	var failedPids []uint32
+	var killedPids []uint32
 	if !p.cfg.RuntimeSecurity.EnforcementEnabled {
-		return failedToKillPids, 0
+		return failedPids, killedPids
 	}
 	var processesKilled int64
 	for _, pc := range kcs {
@@ -303,9 +305,10 @@ func (p *ProcessKiller) KillProcesses(killDirectly bool, ruleID string, sig int,
 
 		if err := p.os.Kill(uint32(sig), &pc); err != nil {
 			seclog.Debugf("failed to kill process %d: %s.", pc.pid, err)
-			failedToKillPids = append(failedToKillPids, uint32(pc.pid))
+			failedPids = append(failedPids, uint32(pc.pid))
 
 		} else {
+			killedPids = append(killedPids, uint32(pc.pid))
 			processesKilled++
 		}
 	}
@@ -319,7 +322,7 @@ func (p *ProcessKiller) KillProcesses(killDirectly bool, ruleID string, sig int,
 	}
 	p.perRuleStatsLock.Unlock()
 
-	return failedToKillPids, processesKilled
+	return failedPids, killedPids
 }
 
 // Start starts the go routine responsible for flushing the disarmer caches and the pending kill queue
@@ -471,21 +474,52 @@ func (p *ProcessKiller) killPendingForDisarmer(disarmer *ruleDisarmer, now time.
 	if len(allKills) == 0 {
 		seclog.Debugf("no pending kill for rule `%s`", disarmer.ruleID)
 	}
-	failedPids, nbKilled := p.KillProcesses(false, disarmer.ruleID, disarmer.killSignal, allKills)
+	failedPids, killedPids := p.KillProcesses(false, disarmer.ruleID, disarmer.killSignal, allKills)
 	for _, r := range disarmer.pendingReports {
-		updateKillActionReport(r, now, failedPids, nbKilled)
+		updateKillActionReport(r, now, failedPids, killedPids)
 	}
 	disarmer.pendingReports = nil
 }
 
 // updateKillActionReport updates the report status based on the outcome of KillProcesses.
-func updateKillActionReport(report *KillActionReport, now time.Time, failedPids []uint32, nbKilled int64) {
+func updateKillActionReport(report *KillActionReport, now time.Time, failedPids []uint32, killedPids []uint32) {
 	report.Lock()
 	defer report.Unlock()
-	if len(failedPids) == 0 {
+	// failedPids and killedPids may aggregate several batched reports (disarmer warmup path); when
+	// report.pendingKills is set, only PIDs belonging to this report are considered.
+	var failedCount, killedCount int
+	if len(report.pendingKills) > 0 {
+		failedSet := make(map[uint32]struct{}, len(failedPids))
+		for _, p := range failedPids {
+			failedSet[p] = struct{}{}
+		}
+		killedSet := make(map[uint32]struct{}, len(killedPids))
+		for _, p := range killedPids {
+			killedSet[p] = struct{}{}
+		}
+		for _, kc := range report.pendingKills {
+			pid := uint32(kc.pid)
+			if _, failed := failedSet[pid]; failed {
+				failedCount++
+			} else if _, killed := killedSet[pid]; killed {
+				killedCount++
+			}
+		}
+		// A PID targeted by this report should appear in exactly one of the aggregate lists; if not,
+		// count it as failed so we never mark the action performed incorrectly.
+		if unaccounted := len(report.pendingKills) - failedCount - killedCount; unaccounted > 0 {
+			seclog.Warnf("unaccounted PIDs in kill action report: %d", unaccounted)
+			failedCount += unaccounted
+		}
+	} else {
+		failedCount = len(failedPids)
+		killedCount = len(killedPids)
+	}
+
+	if failedCount == 0 {
 		report.Status = KillActionStatusPerformed
 		report.KilledAt = now
-	} else if nbKilled > 0 {
+	} else if killedCount > 0 {
 		// Partially performed can happen if a process exited before it was killed
 		// This mostly happens without any disarmer since we never remove any process from the list before killing
 		report.Status = KillActionStatusPartiallyPerformed
