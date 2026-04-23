@@ -115,10 +115,9 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut *mut u16) {
         RegisterServiceCtrlHandlerExW(name.as_ptr(), Some(ctrl_handler), std::ptr::null_mut())
     };
     if handle.is_null() {
-        error!(
-            "RegisterServiceCtrlHandlerExW failed: {}",
-            unsafe { GetLastError() }
-        );
+        error!("RegisterServiceCtrlHandlerExW failed: {}", unsafe {
+            GetLastError()
+        });
         return;
     }
     STATUS_HANDLE.store(handle, Ordering::SeqCst);
