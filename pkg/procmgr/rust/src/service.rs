@@ -37,10 +37,12 @@ use crate::platform;
 use crate::uuid_gen::V4UuidGenerator;
 
 const SERVICE_NAME: &str = "dd-procmgr-service";
-/// Must exceed `DEFAULT_STOP_TIMEOUT_SECS` (90s) + `EXIT_GATE` so that
-/// `ProcessManager::shutdown` can finish gracefully and force-kill any
-/// stubborn children before we hard-exit.
-const HARD_STOP_TIMEOUT: Duration = Duration::from_secs(100);
+/// SCM wait-hint: how long SCM should wait before considering the stop
+/// stalled. Set generously so that `ProcessManager::shutdown` can
+/// gracefully stop + force-kill every child without SCM intervening.
+/// The actual shutdown budget is driven by each child's `stop_timeout`
+/// (default 90s) + `FORCE_KILL_TIMEOUT` (10s).
+const SCM_STOP_WAIT_HINT: Duration = Duration::from_secs(180);
 const EXIT_GATE: Duration = Duration::from_secs(5);
 
 /// Global status handle set by `service_main` before use in the control handler.
@@ -90,16 +92,9 @@ unsafe extern "system" fn ctrl_handler(
                 SERVICE_STOP_PENDING,
                 0,
                 NO_ERROR,
-                HARD_STOP_TIMEOUT.as_millis() as u32,
+                SCM_STOP_WAIT_HINT.as_millis() as u32,
             );
             platform::shutdown_notify().notify_one();
-
-            std::thread::spawn(|| {
-                std::thread::sleep(HARD_STOP_TIMEOUT);
-                eprintln!("hard-stop timeout reached, forcing exit");
-                std::process::exit(1);
-            });
-
             NO_ERROR
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
