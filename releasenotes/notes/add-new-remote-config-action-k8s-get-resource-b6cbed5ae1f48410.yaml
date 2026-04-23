@@ -8,5 +8,4 @@
 ---
 features:
   - |
-    Add a new action get-resource in kubeactions
-
+    Adds a new action ``get-resource`` in kubeactions
