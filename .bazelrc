@@ -61,6 +61,11 @@ common:windows --repo_env=SYSTEMROOT # used by COM to load system DLLs, needed b
 common:windows --repo_env=USERPROFILE # used by MSYS2 bash to emulate HOME, needed by git to fetch repositories
 common:windows --repo_env=VSTUDIO_ROOT # visual_studio(path_variable) in MODULE.bazel
 common:windows --shell_executable=C:/tools/msys64/usr/bin/bash.exe
+# The GNU Rust toolchain needs dlltool.exe from MinGW to generate import libraries.
+# Bazel's sandboxed PATH omits mingw64/bin by default, so we inject a fixed value
+# (not inherited from the host) to keep the cache key deterministic across CI runners.
+common:windows --action_env=PATH=C:/tools/msys64/mingw64/bin;C:/tools/msys64/usr/bin;C:/Windows/System32/WindowsPowerShell/v1.0;C:/Windows/system32;C:/Windows
+common:windows --host_action_env=PATH=C:/tools/msys64/mingw64/bin;C:/tools/msys64/usr/bin;C:/Windows/System32/WindowsPowerShell/v1.0;C:/Windows/system32;C:/Windows
 # Force the x86_64-pc-windows-gnu Rust toolchain (compact name for rust_windows_gnu_x86_64)
 # to take priority over the default MSVC toolchain, since the CI cc_toolchain is MinGW/GCC.
 common:windows --extra_toolchains=@rust_toolchains//:rw-2070622084
